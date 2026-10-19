@@ -46,11 +46,11 @@ class Flow:
         self.nodes.append(node)
         return name
 
-    def link(self, src, dst, output=0):
+    def link(self, src, dst, output=0, target_input=0):
         outs = self.conns.setdefault(src, {"main": []})["main"]
         while len(outs) <= output:
             outs.append([])
-        outs[output].append({"node": dst, "type": "main", "index": 0})
+        outs[output].append({"node": dst, "type": "main", "index": target_input})
 
     def dump(self, filename):
         wf = {"id": self.id, "name": self.name, "nodes": self.nodes, "connections": self.conns,
@@ -201,6 +201,119 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     f.dump("TEST_fallback.json" if fallback_test else "A_loan_product_discovery.json")
 
 
+# ----------------------------------------------------------------------------- Workflow B
+SQL = ROOT / "n8n" / "sql"
+
+
+def sql(name: str) -> str:
+    """SQL file without comment lines (the comments document the file, not the node)."""
+    lines = [l for l in (SQL / name).read_text().splitlines() if not l.strip().startswith("--")]
+    return "\n".join(lines).strip()
+
+
+def pg(f, name, sql_file, params, pos, always_output=False):
+    opts = {"queryReplacement": "={{ " + params + " }}"} if params else {}
+    extra = {"alwaysOutputData": True} if always_output else {}
+    return f.add(name, "n8n-nodes-base.postgres", 2.5,
+                 {"operation": "executeQuery", "query": sql(sql_file), "options": opts},
+                 pos, credentials=CRED_PG, **extra)
+
+
+def groq_node(f, name, pos, interval_ms):
+    body = ("={{ JSON.stringify({ model: 'openai/gpt-oss-120b', temperature: 0, reasoning_effort: 'low', "
+            "max_completion_tokens: 600, response_format: { type: 'json_object' }, messages: ["
+            "{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }] }) }}")
+    return f.add(name, "n8n-nodes-base.httpRequest", 4.2, {
+        "method": "POST", "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": True, "headerParameters": {"parameters": [{"name": "User-Agent", "value": "n8n-loan-matcher/1.0"}]},
+        "sendBody": True, "contentType": "json", "specifyBody": "json", "jsonBody": body,
+        "options": {"timeout": 60000, "batching": {"batch": {"batchSize": 1, "batchInterval": interval_ms}}}},
+        pos, credentials=CRED_GROQ, onError="continueRegularOutput", retryOnFail=True,
+        maxTries=3, waitBetweenTries=10000)
+
+
+def gemini_node(f, name, pos, interval_ms):
+    body = ("={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, "
+            "contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], "
+            "generationConfig: { temperature: 0, responseMimeType: 'application/json', "
+            "thinkingConfig: { thinkingBudget: 0 } } }) }}")
+    return f.add(name, "n8n-nodes-base.httpRequest", 4.2, {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "sendBody": True, "contentType": "json", "specifyBody": "json", "jsonBody": body,
+        "options": {"timeout": 60000, "batching": {"batch": {"batchSize": 1, "batchInterval": interval_ms}}}},
+        pos, credentials=CRED_GEMINI, onError="continueRegularOutput", retryOnFail=True,
+        maxTries=3, waitBetweenTries=15000)
+
+
+def build_workflow_b():
+    f = Flow("workflowB0000001", "B - User-Loan Matching (multi-stage filter)")
+    BATCH = "$('Validate payload').first().json.batch_id"
+
+    f.add("Batch ready (webhook)", "n8n-nodes-base.webhook", 2,
+          {"httpMethod": "POST", "path": "batch-ready", "responseMode": "onReceived", "options": {}},
+          (0, 300), webhookId="batch-ready-webhook")
+    code_node(f, "Validate payload", "validate_payload.js", (240, 300))
+    pg(f, "Mark batch matching", "mark_matching.sql", "[ $json.batch_id ]", (480, 300))
+    pg(f, "Load fresh products", "load_fresh_products.sql", None, (720, 300))
+    code_node(f, "Stage 0: reconcile lenders", "reconcile_products.js", (960, 300))
+    code_node(f, "Collect canonical product ids", "collect_product_ids.js", (1200, 300))
+    pg(f, "Reset candidates", "stage1_reset.sql", "[ " + BATCH + " ]", (1440, 300), always_output=True)
+    pg(f, "Stage 1: SQL envelope pre-filter", "stage1_envelope.sql",
+       "[ " + BATCH + ", JSON.stringify($('Collect canonical product ids').first().json.product_ids) ]", (1680, 300))
+    pg(f, "Stage 2: exact per-type rules", "stage2_exact.sql", "[ " + BATCH + " ]", (1920, 300))
+    pg(f, "Stage 3: find segments needing review", "stage3_segments.sql", "[ " + BATCH + " ]", (2160, 300),
+       always_output=True)
+    if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (2400, 300))
+    f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (2640, 520))
+
+    prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
+    code_node(f, "Build review prompt", "build_review_prompt.js", (2640, 160), __SYSTEM_PROMPT__=prompt)
+    groq_node(f, "Groq: review segment", (2880, 160), 8000)
+    code_node(f, "Validate groq review", "normalize_review.js", (3120, 160), __PROVIDER__="groq")
+    if_node(f, "Groq review valid?", "={{ $json.valid === true }}", (3360, 160))
+    gemini_node(f, "Gemini fallback: review segment", (3600, 300), 7000)
+    code_node(f, "Validate gemini review", "normalize_review.js", (3840, 300), __PROVIDER__="gemini")
+    f.add("Merge review results", "n8n-nodes-base.merge", 3, {"mode": "append"}, (4080, 200))
+    row = ("JSON.stringify({ product_id: $json.product_id, employment_type: $json.employment_type, "
+           "criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, "
+           "provider: $json.extraction_status, valid: $json.valid === true })")
+    pg(f, "Upsert review", "upsert_review.sql", "[ " + row + " ]", (4320, 200))
+    code_node(f, "Stage 3 summary", "stage3_summary.js", (4560, 200))
+
+    pg(f, "Stage 4: write matches", "stage4_write_matches.sql", "[ " + BATCH + " ]", (4800, 300))
+    code_node(f, "Funnel report", "funnel_report.js", (5040, 300))
+    pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (5280, 300))
+    pg(f, "Clean up candidates", "cleanup_candidates.sql", "[ " + BATCH + " ]", (5520, 300), always_output=True)
+    f.add("Hand off to Workflow C (Phase 4)", "n8n-nodes-base.noOp", 1, {}, (5760, 300))
+
+    for a, b in [("Batch ready (webhook)", "Validate payload"), ("Validate payload", "Mark batch matching"),
+                 ("Mark batch matching", "Load fresh products"), ("Load fresh products", "Stage 0: reconcile lenders"),
+                 ("Stage 0: reconcile lenders", "Collect canonical product ids"),
+                 ("Collect canonical product ids", "Reset candidates"), ("Reset candidates", "Stage 1: SQL envelope pre-filter"),
+                 ("Stage 1: SQL envelope pre-filter", "Stage 2: exact per-type rules"),
+                 ("Stage 2: exact per-type rules", "Stage 3: find segments needing review"),
+                 ("Stage 3: find segments needing review", "Needs LLM review?")]:
+        f.link(a, b)
+    f.link("Needs LLM review?", "Build review prompt", 0)
+    f.link("Needs LLM review?", "No reviews needed", 1)
+    for a, b in [("Build review prompt", "Groq: review segment"), ("Groq: review segment", "Validate groq review"),
+                 ("Validate groq review", "Groq review valid?")]:
+        f.link(a, b)
+    f.link("Groq review valid?", "Merge review results", 0, target_input=0)
+    f.link("Groq review valid?", "Gemini fallback: review segment", 1)
+    f.link("Gemini fallback: review segment", "Validate gemini review")
+    f.link("Validate gemini review", "Merge review results", 0, target_input=1)
+    for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Stage 3 summary"),
+                 ("Stage 3 summary", "Stage 4: write matches"), ("No reviews needed", "Stage 4: write matches"),
+                 ("Stage 4: write matches", "Funnel report"), ("Funnel report", "Finish batch"),
+                 ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Hand off to Workflow C (Phase 4)")]:
+        f.link(a, b)
+    f.dump("B_user_loan_matching.json")
+
+
 if __name__ == "__main__":
     import sys
     if "--fallback-test" in sys.argv:
@@ -208,3 +321,4 @@ if __name__ == "__main__":
         build_workflow_a(fallback_test=True)
     else:
         build_workflow_a()
+        build_workflow_b()
