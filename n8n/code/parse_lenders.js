@@ -55,6 +55,25 @@ $input.all().forEach((inp, idx) => {
     return;
   }
 
+  // Single-lender official site (e.g. bajajfinserv.in): the page IS the product page, there
+  // is no table of lenders. Emit one item; "Fetch lender page" re-reads the same URL and the
+  // existing eligibility extraction runs unchanged.
+  const seed = $('Seed sources').itemMatching(idx).json;
+  if (seed.single_product) {
+    const plain = text(stripNoise(html));
+    const m = plain.match(/rate of interest[^%]{0,80}?(\d+(?:\.\d+)?)\s*%[^.]{0,30}/i) ||
+              plain.match(/(\d+(?:\.\d+)?)\s*%\s*p\.?\s*a[^.]{0,20}/i);
+    out.push({
+      json: {
+        source_site, product_name: seed.single_product,
+        interest_rate: m ? parseRate(m[0]) : null, rate_text: m ? m[0].trim() : null,
+        max_amount_text: null, tenure_text: null, fee_text: null, detail_url: list_url,
+      },
+    });
+    console.log(`[${source_site}] single-product page, rate ${m ? m[0].trim() : 'NOT FOUND'}`);
+    return;
+  }
+
   const tables = stripNoise(html).match(/<table[\s\S]*?<\/table>/gi) || [];
   const seen = new Set();
   let count = 0;
