@@ -1,13 +1,13 @@
 // n8n Code node: "Validate <provider> review"  (stamped per provider by build_workflows.py)
 // Turns a raw LLM response into {valid, verdict, caveat}. Anything that is not exactly one of
 // the three verdicts is invalid, which routes the item to the Gemini fallback (or, after
-// Gemini, leaves the segment unreviewed => treated as 'conditional' in Stage 4).
+// Gemini, leaves the segment unreviewed => it is simply retried on the next crawl).
 const PROVIDER = '__PROVIDER__'; // 'groq' | 'gemini'
 // The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved
 // unreliable on real data (it applied a salaried income floor to self-employed applicants,
 // excluded employment types the lender accepts, and flipped between runs), so 'ineligible'
 // is demoted to 'conditional': numeric rules and employment types were already verified
-// exactly in Stages 1-2, and the LLM must not silently remove a user on its own judgement.
+// exactly in SQL (Stages 1-2), and the LLM must not silently remove a user on its own judgement.
 const VERDICTS = ['eligible', 'conditional', 'ineligible'];
 
 function responseText(res) {

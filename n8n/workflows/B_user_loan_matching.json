@@ -159,7 +159,7 @@
       "typeVersion": 2.5,
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH upd AS (\n    UPDATE match_candidates mc\n    SET exact_ok = TRUE\n    FROM users u, loan_products p\n    WHERE mc.batch_id = $1::uuid\n      AND u.user_id = mc.user_id\n      AND p.product_id = mc.product_id\n      AND (\n          p.eligibility_rules IS NULL\n          OR EXISTS (\n              SELECT 1\n              FROM jsonb_array_elements(p.eligibility_rules) AS r\n              WHERE u.employment_status IN (SELECT jsonb_array_elements_text(r -> 'employment_types'))\n                AND u.monthly_income >= COALESCE((r ->> 'min_income')::int, 0)\n                AND u.credit_score   >= COALESCE((r ->> 'min_credit_score')::int, 0)\n                AND u.age BETWEEN COALESCE((r ->> 'min_age')::int, 0) AND COALESCE((r ->> 'max_age')::int, 200)\n          )\n      )\n    RETURNING 1\n)\nSELECT count(*) AS stage2_pairs FROM upd",
+        "query": "WITH upd AS (\n    UPDATE match_candidates mc\n    SET exact_ok = TRUE, credit_margin = x.margin\n    FROM users u, loan_products p,\n    LATERAL (\n        SELECT count(*) AS passing,\n               max(u.credit_score - (r ->> 'min_credit_score')::int) AS margin\n        FROM jsonb_array_elements(p.eligibility_rules) AS r\n        WHERE u.employment_status IN (SELECT jsonb_array_elements_text(r -> 'employment_types'))\n          AND u.monthly_income >= COALESCE((r ->> 'min_income')::int, 0)\n          AND u.credit_score   >= COALESCE((r ->> 'min_credit_score')::int, 0)\n          AND u.age BETWEEN COALESCE((r ->> 'min_age')::int, 0) AND COALESCE((r ->> 'max_age')::int, 200)\n    ) x\n    WHERE mc.batch_id = $1::uuid\n      AND u.user_id = mc.user_id\n      AND p.product_id = mc.product_id\n      AND (p.eligibility_rules IS NULL OR x.passing > 0)\n    RETURNING 1\n)\nSELECT count(*) AS stage2_pairs FROM upd",
         "options": {
           "queryReplacement": "={{ [ $('Validate payload').first().json.batch_id ] }}"
         }
@@ -176,299 +176,19 @@
       }
     },
     {
-      "id": "70bbc4f0-3d7c-5709-8b74-94a3140b19a9",
-      "name": "Stage 3: find segments needing review",
+      "id": "5fd30dfc-974a-5a7c-adbd-194fde1763fd",
+      "name": "Stage 3: rank and keep top lenders",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT p.product_id,\n       p.product_name,\n       p.qualitative_criteria_text,\n       md5('rv3|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash,\n       left(COALESCE(p.raw_criteria_text, ''), 1500)                     AS source_text,\n       array_to_string(p.allowed_employment_types, ', ')                 AS accepted_types,\n       u.employment_status                                               AS employment_type,\n       count(*)                                                          AS candidates,\n       min(u.monthly_income)                                             AS income_min,\n       (percentile_cont(0.5) WITHIN GROUP (ORDER BY u.monthly_income))::int AS income_median,\n       max(u.monthly_income)                                             AS income_max,\n       min(u.credit_score)                                               AS score_min,\n       max(u.credit_score)                                               AS score_max,\n       min(u.age)                                                        AS age_min,\n       max(u.age)                                                        AS age_max\nFROM match_candidates mc\nJOIN users u          ON u.user_id = mc.user_id\nJOIN loan_products p  ON p.product_id = mc.product_id\nLEFT JOIN qualitative_reviews r\n       ON r.product_id = p.product_id AND r.employment_type = u.employment_status\nWHERE mc.batch_id = $1::uuid\n  AND mc.exact_ok\n  AND p.qualitative_criteria_text IS NOT NULL\n  AND r.criteria_hash IS DISTINCT FROM md5('rv3|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, ''))\nGROUP BY p.product_id, p.product_name, p.qualitative_criteria_text, p.raw_criteria_text,\n         p.allowed_employment_types, u.employment_status\nORDER BY p.product_id, u.employment_status",
+        "query": "WITH ranked AS (\n    SELECT mc.user_id, mc.product_id, mc.credit_margin,\n           row_number() OVER (\n               PARTITION BY mc.user_id\n               ORDER BY p.interest_rate ASC NULLS LAST, mc.credit_margin DESC NULLS LAST, mc.product_id\n           ) AS rn\n    FROM match_candidates mc\n    JOIN loan_products p ON p.product_id = mc.product_id\n    WHERE mc.batch_id = $1::uuid AND mc.exact_ok\n), ins AS (\n    INSERT INTO matches (user_id, product_id, match_method, match_rank, credit_margin)\n    SELECT user_id, product_id, 'numeric', rn, credit_margin\n    FROM ranked\n    WHERE rn <= $2::int\n    ON CONFLICT (user_id, product_id) DO UPDATE\n        SET match_rank = EXCLUDED.match_rank, credit_margin = EXCLUDED.credit_margin\n        WHERE matches.notified_at IS NULL\n    RETURNING user_id\n)\nSELECT (SELECT count(*) FROM match_candidates WHERE batch_id = $1::uuid AND exact_ok) AS stage2_pairs,\n       (SELECT count(DISTINCT user_id) FROM match_candidates WHERE batch_id = $1::uuid AND exact_ok) AS users_with_a_match,\n       count(*)                  AS matches_written,\n       count(DISTINCT user_id)   AS users_matched\nFROM ins",
         "options": {
-          "queryReplacement": "={{ [ $('Validate payload').first().json.batch_id ] }}"
+          "queryReplacement": "={{ [ $('Validate payload').first().json.batch_id, 5 ] }}"
         }
       },
       "position": [
         2160,
-        300
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "credPostgres00001",
-          "name": "Loan DB (RDS)"
-        }
-      },
-      "alwaysOutputData": true
-    },
-    {
-      "id": "9acba9ca-840e-5f26-880b-fe400293e7d9",
-      "name": "Needs LLM review?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "8edc0256-c6ee-518c-9fd0-85a5bc4811ec",
-              "leftValue": "={{ $json.product_id !== undefined }}",
-              "rightValue": "",
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "position": [
-        2400,
-        300
-      ]
-    },
-    {
-      "id": "acb99c8e-f79e-59e7-b425-38cbcbe6c8eb",
-      "name": "No reviews needed",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "parameters": {},
-      "position": [
-        2640,
-        520
-      ]
-    },
-    {
-      "id": "c7517a49-21da-51ef-8aa7-7b6cbffabe72",
-      "name": "Build review prompt",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Build review prompt\"\n// One item per (product x employment-type) segment. The prompt carries the lender's fuzzy\n// criteria plus the segment's real ranges from the database, so the model judges this\n// segment rather than guessing about a generic applicant.\nconst SYSTEM = \"You help explain personal-loan eligibility to customers. A group of applicants has ALREADY been checked against the lender's numeric rules (monthly income, credit score, age) and the employment types the lender accepts. Your job is only to say how confident the match is and, when relevant, what the customer still needs to check.\\n\\nYou receive: a summary of one applicant segment from a customer database (employment type, plus ranges of monthly income in INR, credit score and age), the employment types the lender's structured data accepts, the lender's qualitative requirements (a summary) and the lender's original source text (ground truth).\\n\\nIMPORTANT: the database contains ONLY employment type, monthly income, credit score and age. It has NO information about work experience, employer or employer category, city, education, profession, an existing bank account or relationship, or nationality.\\n\\nYou NEVER reject applicants. Numeric limits and accepted employment types are already decided; do not re-judge them.\\n\\nReturn ONLY a JSON object: {\\\"verdict\\\":\\\"conditional\\\",\\\"caveat\\\":\\\"...\\\"}\\n- verdict \\\"eligible\\\": the qualitative requirements place no extra conditions on this segment.\\n- verdict \\\"conditional\\\": the segment may qualify, but it depends on facts missing from the database (work experience, employer type, city, profession, existing bank relationship, nationality, ...). Name the most important ones in the caveat.\\n- caveat: one plain-English sentence addressed to the customer, at most 140 characters, no jargon; null when the verdict is \\\"eligible\\\". Only state conditions that appear in the lender's text; never invent a threshold.\";\nconst inr = (n) => '\\u20b9' + Number(n).toLocaleString('en-IN');\n\nreturn $input.all().map(({ json: s }) => ({\n  json: {\n    ...s,\n    system_prompt: SYSTEM,\n    user_prompt:\n      `Lender product: ${s.product_name}\\n` +\n      `Applicant segment: ${s.employment_type}, ${s.candidates} applicants\\n` +\n      `Monthly income: ${inr(s.income_min)} to ${inr(s.income_max)} (median ${inr(s.income_median)})\\n` +\n      `Credit score: ${s.score_min} to ${s.score_max}\\n` +\n      `Age: ${s.age_min} to ${s.age_max}\\n\\n` +\n      `Employment types the lender's structured data accepts: ${s.accepted_types || 'not stated'}\\n\\n` +\n      `Lender's qualitative requirements (summary):\\n${s.qualitative_criteria_text}\\n\\n` +\n      `Lender's source eligibility text (ground truth):\\n${s.source_text || '(not available)'}`,\n  },\n}));\n"
-      },
-      "position": [
-        2640,
-        160
-      ]
-    },
-    {
-      "id": "a57c6a47-4375-5431-a923-a49062fa1a6d",
-      "name": "Groq: review segment",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.groq.com/openai/v1/chat/completions",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "User-Agent",
-              "value": "n8n-loan-matcher/1.0"
-            }
-          ]
-        },
-        "sendBody": true,
-        "contentType": "json",
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-oss-120b', temperature: 0, reasoning_effort: 'low', max_completion_tokens: 600, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }] }) }}",
-        "options": {
-          "timeout": 60000,
-          "batching": {
-            "batch": {
-              "batchSize": 1,
-              "batchInterval": 8000
-            }
-          }
-        }
-      },
-      "position": [
-        2880,
-        160
-      ],
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "credGroq000000001",
-          "name": "Groq API"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 10000
-    },
-    {
-      "id": "9bfca6c0-69ae-5d48-9b1e-c2543e83bc66",
-      "name": "Validate groq review",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Validate <provider> review\"  (stamped per provider by build_workflows.py)\n// Turns a raw LLM response into {valid, verdict, caveat}. Anything that is not exactly one of\n// the three verdicts is invalid, which routes the item to the Gemini fallback (or, after\n// Gemini, leaves the segment unreviewed => treated as 'conditional' in Stage 4).\nconst PROVIDER = 'groq'; // 'groq' | 'gemini'\n// The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved\n// unreliable on real data (it applied a salaried income floor to self-employed applicants,\n// excluded employment types the lender accepts, and flipped between runs), so 'ineligible'\n// is demoted to 'conditional': numeric rules and employment types were already verified\n// exactly in Stages 1-2, and the LLM must not silently remove a user on its own judgement.\nconst VERDICTS = ['eligible', 'conditional', 'ineligible'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build review prompt').itemMatching(i).json;\n  const fail = (why) => ({ json: { ...original, valid: false, extraction_status: `invalid_${PROVIDER}`, llm_error: why } });\n  if (item.json && item.json.error) return fail(`request failed: ${JSON.stringify(item.json.error).slice(0, 160)}`);\n\n  const parsed = parseJson(responseText(item.json));\n  let verdict = parsed && typeof parsed.verdict === 'string' ? parsed.verdict.trim().toLowerCase() : null;\n  if (!VERDICTS.includes(verdict)) return fail('response had no valid verdict');\n  const demoted = verdict === 'ineligible';\n  if (demoted) verdict = 'conditional';\n\n  let caveat = typeof parsed.caveat === 'string' ? parsed.caveat.trim() : null;\n  if (caveat && /^(null|none|n\\/a)$/i.test(caveat)) caveat = null;\n  if (caveat && caveat.length > 160) caveat = caveat.slice(0, 157) + '...';\n  if (verdict === 'eligible') caveat = null;\n  if (demoted && !caveat) caveat = 'The lender has extra requirements we could not check.';\n\n  return { json: { ...original, valid: true, extraction_status: `llm_${PROVIDER}`, verdict, caveat, demoted_ineligible: demoted } };\n});\n"
-      },
-      "position": [
-        3120,
-        160
-      ]
-    },
-    {
-      "id": "d0cb7d5c-51df-54c6-840e-a8fb7afa4678",
-      "name": "Groq review valid?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "3b8865ca-7f02-5633-9ad0-415fc18ef6f9",
-              "leftValue": "={{ $json.valid === true }}",
-              "rightValue": "",
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "position": [
-        3360,
-        160
-      ]
-    },
-    {
-      "id": "674519d0-a730-559f-8c11-a89fd7184b11",
-      "name": "Gemini fallback: review segment",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "parameters": {
-        "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "contentType": "json",
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } } }) }}",
-        "options": {
-          "timeout": 60000,
-          "batching": {
-            "batch": {
-              "batchSize": 1,
-              "batchInterval": 7000
-            }
-          }
-        }
-      },
-      "position": [
-        3600,
-        300
-      ],
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "credGemini0000001",
-          "name": "Gemini API"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 15000
-    },
-    {
-      "id": "9497db59-7d08-5558-891d-ce795b0c40cc",
-      "name": "Validate gemini review",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Validate <provider> review\"  (stamped per provider by build_workflows.py)\n// Turns a raw LLM response into {valid, verdict, caveat}. Anything that is not exactly one of\n// the three verdicts is invalid, which routes the item to the Gemini fallback (or, after\n// Gemini, leaves the segment unreviewed => treated as 'conditional' in Stage 4).\nconst PROVIDER = 'gemini'; // 'groq' | 'gemini'\n// The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved\n// unreliable on real data (it applied a salaried income floor to self-employed applicants,\n// excluded employment types the lender accepts, and flipped between runs), so 'ineligible'\n// is demoted to 'conditional': numeric rules and employment types were already verified\n// exactly in Stages 1-2, and the LLM must not silently remove a user on its own judgement.\nconst VERDICTS = ['eligible', 'conditional', 'ineligible'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build review prompt').itemMatching(i).json;\n  const fail = (why) => ({ json: { ...original, valid: false, extraction_status: `invalid_${PROVIDER}`, llm_error: why } });\n  if (item.json && item.json.error) return fail(`request failed: ${JSON.stringify(item.json.error).slice(0, 160)}`);\n\n  const parsed = parseJson(responseText(item.json));\n  let verdict = parsed && typeof parsed.verdict === 'string' ? parsed.verdict.trim().toLowerCase() : null;\n  if (!VERDICTS.includes(verdict)) return fail('response had no valid verdict');\n  const demoted = verdict === 'ineligible';\n  if (demoted) verdict = 'conditional';\n\n  let caveat = typeof parsed.caveat === 'string' ? parsed.caveat.trim() : null;\n  if (caveat && /^(null|none|n\\/a)$/i.test(caveat)) caveat = null;\n  if (caveat && caveat.length > 160) caveat = caveat.slice(0, 157) + '...';\n  if (verdict === 'eligible') caveat = null;\n  if (demoted && !caveat) caveat = 'The lender has extra requirements we could not check.';\n\n  return { json: { ...original, valid: true, extraction_status: `llm_${PROVIDER}`, verdict, caveat, demoted_ineligible: demoted } };\n});\n"
-      },
-      "position": [
-        3840,
-        300
-      ]
-    },
-    {
-      "id": "ae94eabb-b023-5d7a-ac01-5ca8d92b1c68",
-      "name": "Merge review results",
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 3,
-      "parameters": {
-        "mode": "append"
-      },
-      "position": [
-        4080,
-        200
-      ]
-    },
-    {
-      "id": "aa377d6f-a8e6-540f-abcf-f60c993b6cae",
-      "name": "Upsert review",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH ins AS (\n    INSERT INTO qualitative_reviews (product_id, employment_type, criteria_hash, verdict, caveat, provider)\n    SELECT (r->>'product_id')::bigint, r->>'employment_type', r->>'criteria_hash',\n           r->>'verdict', r->>'caveat', r->>'provider'\n    FROM (SELECT $1::jsonb AS r) x\n    WHERE (r->>'valid')::boolean\n    ON CONFLICT (product_id, employment_type) DO UPDATE SET\n        criteria_hash = EXCLUDED.criteria_hash, verdict = EXCLUDED.verdict,\n        caveat = EXCLUDED.caveat, provider = EXCLUDED.provider, reviewed_at = now()\n    RETURNING 1\n)\nSELECT (SELECT count(*) FROM ins) AS saved",
-        "options": {
-          "queryReplacement": "={{ [ JSON.stringify({ product_id: $json.product_id, employment_type: $json.employment_type, criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, provider: $json.extraction_status, valid: $json.valid === true }) ] }}"
-        }
-      },
-      "position": [
-        4320,
-        200
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "credPostgres00001",
-          "name": "Loan DB (RDS)"
-        }
-      }
-    },
-    {
-      "id": "f73bf601-8c02-5ed4-b5c9-28a605969add",
-      "name": "Stage 3 summary",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Stage 3 summary\"  (runs once, after every review has been saved)\nconst merged = $('Merge review results').all().map((i) => i.json);\nconst count = (st) => merged.filter((m) => m.extraction_status === st).length;\nreturn [{\n  json: {\n    llm_review_calls: merged.length,        // one call (or fallback pair) per segment\n    reviewed_by_groq: count('llm_groq'),\n    reviewed_by_gemini: count('llm_gemini'),\n    review_failed: count('invalid_gemini'), // both models failed => segment left 'conditional'\n    reviews_saved: $input.all().reduce((n, i) => n + Number(i.json.saved || 0), 0),\n  },\n}];\n"
-      },
-      "position": [
-        4560,
-        200
-      ]
-    },
-    {
-      "id": "f345c82a-fefb-5960-a08b-8a1efe2f6e5b",
-      "name": "Stage 4: write matches",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH ins AS (\n    INSERT INTO matches (user_id, product_id, match_method)\n    SELECT mc.user_id, mc.product_id,\n           CASE WHEN r.verdict IS NOT NULL THEN 'llm' ELSE 'numeric' END\n    FROM match_candidates mc\n    JOIN users u         ON u.user_id = mc.user_id\n    JOIN loan_products p ON p.product_id = mc.product_id\n    LEFT JOIN qualitative_reviews r\n           ON r.product_id = mc.product_id\n          AND r.employment_type = u.employment_status\n          AND r.criteria_hash = md5('rv3|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, ''))\n    WHERE mc.batch_id = $1::uuid\n      AND mc.exact_ok\n      AND COALESCE(r.verdict, 'conditional') <> 'ineligible'\n    ON CONFLICT (user_id, product_id) DO NOTHING\n    RETURNING 1\n)\nSELECT (SELECT count(*) FROM match_candidates WHERE batch_id = $1::uuid AND exact_ok) AS stage2_pairs,\n       count(*)                                                                        AS matches_written,\n       (SELECT count(*)\n          FROM match_candidates mc\n          JOIN users u ON u.user_id = mc.user_id\n          JOIN loan_products p ON p.product_id = mc.product_id\n          JOIN qualitative_reviews r ON r.product_id = mc.product_id\n                                    AND r.employment_type = u.employment_status\n                                    AND r.criteria_hash = md5('rv3|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, ''))\n         WHERE mc.batch_id = $1::uuid AND mc.exact_ok AND r.verdict = 'ineligible')      AS dropped_by_llm,\n       (SELECT count(*)\n          FROM (SELECT DISTINCT mc.product_id, u.employment_status\n                  FROM match_candidates mc\n                  JOIN users u ON u.user_id = mc.user_id\n                  JOIN loan_products p ON p.product_id = mc.product_id\n                 WHERE mc.batch_id = $1::uuid AND mc.exact_ok\n                   AND p.qualitative_criteria_text IS NOT NULL) seg)                     AS segments_total\nFROM ins",
-        "options": {
-          "queryReplacement": "={{ [ $('Validate payload').first().json.batch_id ] }}"
-        }
-      },
-      "position": [
-        4800,
         300
       ],
       "credentials": {
@@ -485,10 +205,10 @@
       "typeVersion": 2,
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Funnel report\"  (runs once, after Stage 4)\n// Gathers how many user-product pairs survived each stage. This is the evidence for the\n// optimisation: naive pairs vs how many reached an LLM.\nconst first = (n) => $(n).first().json;\nconst num = (v) => Number(v) || 0;\n\nconst collect = first('Collect canonical product ids');\nconst s1 = first('Stage 1: SQL envelope pre-filter');\nlet s3 = { llm_review_calls: 0, reviewed_by_groq: 0, reviewed_by_gemini: 0, review_failed: 0, reviews_saved: 0 };\ntry { s3 = first('Stage 3 summary'); } catch (e) { /* branch not executed: nothing needed review */ }\nconst s4 = first('Stage 4: write matches');\n\nconst users = num(s1.users_in_batch);\nconst stats = {\n  users_in_batch: users,\n  products_fresh: collect.products_fresh,\n  products_after_reconcile: collect.products_canonical,\n  lenders_merged_groups: collect.merged_groups,\n  pairs_naive: users * collect.products_fresh,\n  pairs_after_reconcile: users * collect.products_canonical,\n  pairs_after_stage1_envelope: num(s1.stage1_pairs),\n  pairs_after_stage2_exact_rules: num(s4.stage2_pairs),\n  llm_segments_total: num(s4.segments_total),\n  llm_review_calls: num(s3.llm_review_calls),\n  llm_cached_segments: Math.max(num(s4.segments_total) - num(s3.llm_review_calls), 0),\n  llm_by_groq: num(s3.reviewed_by_groq),\n  llm_by_gemini: num(s3.reviewed_by_gemini),\n  llm_failed: num(s3.review_failed),\n  pairs_dropped_by_llm: num(s4.dropped_by_llm),\n  matches_written: num(s4.matches_written),\n  finished_at: new Date().toISOString(),\n};\nreturn [{ json: { batch_id: collect.batch_id, stats, stats_json: JSON.stringify(stats) } }];\n"
+        "jsCode": "// n8n Code node: \"Funnel report\"  (runs once, after Stage 3)\n// Gathers how many user-product pairs survived each stage. This is the evidence for the\n// optimisation: naive pairs vs pairs actually kept. No LLM runs in this workflow.\nconst first = (n) => $(n).first().json;\nconst num = (v) => Number(v) || 0;\n\nconst collect = first('Collect canonical product ids');\nconst s1 = first('Stage 1: SQL envelope pre-filter');\nconst s3 = first('Stage 3: rank and keep top lenders');\n\nconst users = num(s1.users_in_batch);\nconst stats = {\n  users_in_batch: users,\n  products_fresh: collect.products_fresh,\n  products_after_reconcile: collect.products_canonical,\n  lenders_merged_groups: collect.merged_groups,\n  pairs_naive: users * collect.products_fresh,\n  pairs_after_reconcile: users * collect.products_canonical,\n  pairs_after_stage1_envelope: num(s1.stage1_pairs),\n  pairs_after_stage2_exact_rules: num(s3.stage2_pairs),\n  users_with_a_qualifying_lender: num(s3.users_with_a_match),\n  top_n_per_user: 5,\n  matches_written: num(s3.matches_written),\n  users_matched: num(s3.users_matched),\n  llm_calls_in_this_workflow: 0,\n  finished_at: new Date().toISOString(),\n};\nreturn [{ json: { batch_id: collect.batch_id, stats, stats_json: JSON.stringify(stats) } }];\n"
       },
       "position": [
-        5040,
+        2400,
         300
       ]
     },
@@ -505,7 +225,7 @@
         }
       },
       "position": [
-        5280,
+        2640,
         300
       ],
       "credentials": {
@@ -528,7 +248,7 @@
         }
       },
       "position": [
-        5520,
+        2880,
         300
       ],
       "credentials": {
@@ -546,7 +266,7 @@
       "typeVersion": 1,
       "parameters": {},
       "position": [
-        5760,
+        3120,
         300
       ]
     }
@@ -644,160 +364,14 @@
       "main": [
         [
           {
-            "node": "Stage 3: find segments needing review",
+            "node": "Stage 3: rank and keep top lenders",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Stage 3: find segments needing review": {
-      "main": [
-        [
-          {
-            "node": "Needs LLM review?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Needs LLM review?": {
-      "main": [
-        [
-          {
-            "node": "Build review prompt",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "No reviews needed",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Build review prompt": {
-      "main": [
-        [
-          {
-            "node": "Groq: review segment",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Groq: review segment": {
-      "main": [
-        [
-          {
-            "node": "Validate groq review",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Validate groq review": {
-      "main": [
-        [
-          {
-            "node": "Groq review valid?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Groq review valid?": {
-      "main": [
-        [
-          {
-            "node": "Merge review results",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Gemini fallback: review segment",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Gemini fallback: review segment": {
-      "main": [
-        [
-          {
-            "node": "Validate gemini review",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Validate gemini review": {
-      "main": [
-        [
-          {
-            "node": "Merge review results",
-            "type": "main",
-            "index": 1
-          }
-        ]
-      ]
-    },
-    "Merge review results": {
-      "main": [
-        [
-          {
-            "node": "Upsert review",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Upsert review": {
-      "main": [
-        [
-          {
-            "node": "Stage 3 summary",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Stage 3 summary": {
-      "main": [
-        [
-          {
-            "node": "Stage 4: write matches",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "No reviews needed": {
-      "main": [
-        [
-          {
-            "node": "Stage 4: write matches",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Stage 4: write matches": {
+    "Stage 3: rank and keep top lenders": {
       "main": [
         [
           {

@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+TOP_N = 5  # lenders kept per user (the most relevant ones: lowest rate first)
 CODE = ROOT / "n8n" / "code"
 OUT = ROOT / "n8n" / "workflows"
 
@@ -176,6 +177,26 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
           (3600, 200), credentials=CRED_PG)
     code_node(f, "Crawl summary", "crawl_summary.js", (3840, 200))
 
+    if not fallback_test:
+        # Qualitative notes are produced HERE, once per lender, not on every CSV upload: the
+        # criteria only change when the crawl does. Unchanged text hits the cache (0 LLM calls).
+        pg(f, "Plan reviews (cache check)", "plan_reviews.sql", None, (4080, 200), always_output=True)
+        if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (4320, 200))
+        f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (4560, 420))
+        prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
+        code_node(f, "Build review prompt", "build_review_prompt.js", (4560, 100), __SYSTEM_PROMPT__=prompt)
+        groq_node(f, "Groq: review segment", (4800, 100), 8000)
+        code_node(f, "Validate groq review", "normalize_review.js", (5040, 100), __PROVIDER__="groq")
+        if_node(f, "Groq review valid?", "={{ $json.valid === true }}", (5280, 100))
+        gemini_node(f, "Gemini fallback: review segment", (5520, 240), 7000)
+        code_node(f, "Validate gemini review", "normalize_review.js", (5760, 240), __PROVIDER__="gemini")
+        f.add("Merge review results", "n8n-nodes-base.merge", 3, {"mode": "append"}, (6000, 140))
+        rrow = ("JSON.stringify({ product_id: $json.product_id, employment_type: $json.employment_type, "
+                "criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, "
+                "provider: $json.extraction_status, valid: $json.valid === true })")
+        pg(f, "Upsert review", "upsert_review.sql", "[ " + rrow + " ]", (6240, 140))
+        code_node(f, "Review summary", "review_summary.js", (6480, 140))
+
     for t in ("Daily schedule", "Manual trigger", "Crawl now (webhook)"):
         if not (fallback_test and t != "Crawl now (webhook)"):
             f.link(t, "Seed sources")
@@ -198,6 +219,20 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     f.link("Gemini output valid?", "Upsert loan product", 0)
     f.link("Gemini output valid?", "Dropped: both LLMs failed", 1)
     f.link("Upsert loan product", "Crawl summary")
+    if not fallback_test:
+        f.link("Crawl summary", "Plan reviews (cache check)")
+        f.link("Plan reviews (cache check)", "Needs LLM review?")
+        f.link("Needs LLM review?", "Build review prompt", 0)
+        f.link("Needs LLM review?", "No reviews needed", 1)
+        for a, b in [("Build review prompt", "Groq: review segment"), ("Groq: review segment", "Validate groq review"),
+                     ("Validate groq review", "Groq review valid?")]:
+            f.link(a, b)
+        f.link("Groq review valid?", "Merge review results", 0, target_input=0)
+        f.link("Groq review valid?", "Gemini fallback: review segment", 1)
+        f.link("Gemini fallback: review segment", "Validate gemini review")
+        f.link("Validate gemini review", "Merge review results", 0, target_input=1)
+        for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Review summary")]:
+            f.link(a, b)
     f.dump("TEST_fallback.json" if fallback_test else "A_loan_product_discovery.json")
 
 
@@ -264,51 +299,20 @@ def build_workflow_b():
     pg(f, "Stage 1: SQL envelope pre-filter", "stage1_envelope.sql",
        "[ " + BATCH + ", JSON.stringify($('Collect canonical product ids').first().json.product_ids) ]", (1680, 300))
     pg(f, "Stage 2: exact per-type rules", "stage2_exact.sql", "[ " + BATCH + " ]", (1920, 300))
-    pg(f, "Stage 3: find segments needing review", "stage3_segments.sql", "[ " + BATCH + " ]", (2160, 300),
-       always_output=True)
-    if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (2400, 300))
-    f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (2640, 520))
-
-    prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
-    code_node(f, "Build review prompt", "build_review_prompt.js", (2640, 160), __SYSTEM_PROMPT__=prompt)
-    groq_node(f, "Groq: review segment", (2880, 160), 8000)
-    code_node(f, "Validate groq review", "normalize_review.js", (3120, 160), __PROVIDER__="groq")
-    if_node(f, "Groq review valid?", "={{ $json.valid === true }}", (3360, 160))
-    gemini_node(f, "Gemini fallback: review segment", (3600, 300), 7000)
-    code_node(f, "Validate gemini review", "normalize_review.js", (3840, 300), __PROVIDER__="gemini")
-    f.add("Merge review results", "n8n-nodes-base.merge", 3, {"mode": "append"}, (4080, 200))
-    row = ("JSON.stringify({ product_id: $json.product_id, employment_type: $json.employment_type, "
-           "criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, "
-           "provider: $json.extraction_status, valid: $json.valid === true })")
-    pg(f, "Upsert review", "upsert_review.sql", "[ " + row + " ]", (4320, 200))
-    code_node(f, "Stage 3 summary", "stage3_summary.js", (4560, 200))
-
-    pg(f, "Stage 4: write matches", "stage4_write_matches.sql", "[ " + BATCH + " ]", (4800, 300))
-    code_node(f, "Funnel report", "funnel_report.js", (5040, 300))
-    pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (5280, 300))
-    pg(f, "Clean up candidates", "cleanup_candidates.sql", "[ " + BATCH + " ]", (5520, 300), always_output=True)
-    f.add("Hand off to Workflow C (Phase 4)", "n8n-nodes-base.noOp", 1, {}, (5760, 300))
+    pg(f, "Stage 3: rank and keep top lenders", "stage3_rank_top.sql", "[ " + BATCH + ", " + str(TOP_N) + " ]",
+       (2160, 300))
+    code_node(f, "Funnel report", "funnel_report.js", (2400, 300), __TOP_N__=str(TOP_N))
+    pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (2640, 300))
+    pg(f, "Clean up candidates", "cleanup_candidates.sql", "[ " + BATCH + " ]", (2880, 300), always_output=True)
+    f.add("Hand off to Workflow C (Phase 4)", "n8n-nodes-base.noOp", 1, {}, (3120, 300))
 
     for a, b in [("Batch ready (webhook)", "Validate payload"), ("Validate payload", "Mark batch matching"),
                  ("Mark batch matching", "Load fresh products"), ("Load fresh products", "Stage 0: reconcile lenders"),
                  ("Stage 0: reconcile lenders", "Collect canonical product ids"),
                  ("Collect canonical product ids", "Reset candidates"), ("Reset candidates", "Stage 1: SQL envelope pre-filter"),
                  ("Stage 1: SQL envelope pre-filter", "Stage 2: exact per-type rules"),
-                 ("Stage 2: exact per-type rules", "Stage 3: find segments needing review"),
-                 ("Stage 3: find segments needing review", "Needs LLM review?")]:
-        f.link(a, b)
-    f.link("Needs LLM review?", "Build review prompt", 0)
-    f.link("Needs LLM review?", "No reviews needed", 1)
-    for a, b in [("Build review prompt", "Groq: review segment"), ("Groq: review segment", "Validate groq review"),
-                 ("Validate groq review", "Groq review valid?")]:
-        f.link(a, b)
-    f.link("Groq review valid?", "Merge review results", 0, target_input=0)
-    f.link("Groq review valid?", "Gemini fallback: review segment", 1)
-    f.link("Gemini fallback: review segment", "Validate gemini review")
-    f.link("Validate gemini review", "Merge review results", 0, target_input=1)
-    for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Stage 3 summary"),
-                 ("Stage 3 summary", "Stage 4: write matches"), ("No reviews needed", "Stage 4: write matches"),
-                 ("Stage 4: write matches", "Funnel report"), ("Funnel report", "Finish batch"),
+                 ("Stage 2: exact per-type rules", "Stage 3: rank and keep top lenders"),
+                 ("Stage 3: rank and keep top lenders", "Funnel report"), ("Funnel report", "Finish batch"),
                  ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Hand off to Workflow C (Phase 4)")]:
         f.link(a, b)
     f.dump("B_user_loan_matching.json")
