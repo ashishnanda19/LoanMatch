@@ -1,0 +1,33 @@
+#!/bin/bash
+# First-boot provisioning for the n8n host (Amazon Linux 2023). Runs once via cloud-init.
+set -euxo pipefail
+
+# 1 GiB RAM is tight for n8n: add swap so the OOM killer leaves it alone.
+fallocate -l 2G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+dnf install -y docker
+systemctl enable --now docker
+
+# docker compose v2 plugin (not packaged in AL2023 repos)
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+mkdir -p /opt/n8n
+echo '${compose_b64}' | base64 -d > /opt/n8n/docker-compose.yml
+
+cat > /opt/n8n/.env <<'ENVEOF'
+N8N_ENCRYPTION_KEY=${encryption_key}
+N8N_HOST=${public_ip}
+WEBHOOK_URL=http://${public_ip}:5678/
+GENERIC_TIMEZONE=Asia/Kolkata
+ENVEOF
+chmod 600 /opt/n8n/.env
+
+cd /opt/n8n
+docker compose up -d

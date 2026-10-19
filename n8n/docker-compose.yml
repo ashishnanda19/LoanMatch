@@ -1,0 +1,23 @@
+# n8n, self-hosted. On EC2 this file is copied to /opt/n8n by Terraform (user_data)
+# next to a generated .env. Locally: cp .env.example .env && docker compose up -d
+services:
+  n8n:
+    image: n8nio/n8n:2.44.4          # pinned; bump deliberately
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env                          # N8N_ENCRYPTION_KEY, N8N_HOST, WEBHOOK_URL, GENERIC_TIMEZONE
+    environment:
+      - N8N_PROTOCOL=http
+      - N8N_SECURE_COOKIE=false       # we serve plain HTTP (see README: prod would add HTTPS)
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - EXECUTIONS_DATA_PRUNE=true    # keep the small disk from filling up
+      - EXECUTIONS_DATA_MAX_AGE=168   # hours
+      - NODE_OPTIONS=--max-old-space-size=512   # t3.micro has 1 GiB RAM
+    volumes:
+      - n8n_data:/home/node/.n8n      # workflows, encrypted credentials, SQLite DB
+
+volumes:
+  n8n_data:

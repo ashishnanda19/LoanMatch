@@ -1,0 +1,83 @@
+# Thin Serverless Framework definition of the two Lambdas, the HTTP API and the
+# S3 trigger -- the same shape that Terraform provisions in ingestion.tf.
+#
+# Division of labour:
+#   * Terraform (infra/*.tf) is the primary deploy path: it owns VPC/SGs, RDS, S3,
+#     IAM, the n8n EC2 host, AND these functions.
+#   * This file lets the function layer be deployed/iterated with the Serverless
+#     Framework on top of Terraform-owned infrastructure. Feed it Terraform's
+#     values via env vars (see README "Deploying with Serverless Framework").
+#
+# Usage (after `terraform apply` and scripts/build_lambdas.sh):
+#   export TF_UPLOAD_BUCKET=$(terraform output -raw upload_bucket)
+#   ... (see README for the full list)
+#   npx serverless@3 deploy --config serverless.yml
+#
+# NOTE: deploying with BOTH tools to the same function names will conflict;
+# pick one deploy path per environment (the stage below defaults to "sls" to keep
+# names distinct from Terraform's).
+
+service: loan-engine
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  region: ${env:AWS_REGION, "ap-south-1"}
+  stage: ${opt:stage, "sls"}
+  httpApi:
+    cors:
+      allowedOrigins: ["*"]
+      allowedHeaders: ["content-type"]
+      allowedMethods: ["POST", "OPTIONS"]
+  # Reuse the least-privilege roles Terraform created instead of letting
+  # Serverless generate broad ones.
+  iam:
+    role: ${env:TF_PARSE_CSV_ROLE_ARN}
+
+package:
+  individually: true
+
+functions:
+  getUploadUrl:
+    handler: handler.lambda_handler
+    timeout: 10
+    memorySize: 128
+    role: ${env:TF_GET_UPLOAD_URL_ROLE_ARN}
+    package:
+      artifact: ../build/get_upload_url.zip
+    environment:
+      UPLOAD_BUCKET: ${env:TF_UPLOAD_BUCKET}
+      MAX_UPLOAD_BYTES: "104857600"
+    events:
+      - httpApi:
+          method: POST
+          path: /upload-url
+
+  parseCsv:
+    handler: handler.lambda_handler
+    timeout: 300
+    memorySize: 512
+    package:
+      artifact: ../build/parse_csv.zip
+    vpc:
+      securityGroupIds:
+        - ${env:TF_LAMBDA_SG_ID}
+      subnetIds: ${env:TF_SUBNET_IDS_JSON}   # e.g. '["subnet-a","subnet-b"]'
+    environment:
+      DB_HOST: ${env:TF_DB_HOST}
+      DB_PORT: "5432"
+      DB_NAME: ${env:TF_DB_NAME}
+      DB_USER: ${env:TF_DB_USER}
+      DB_PASSWORD: ${env:TF_DB_PASSWORD}
+      N8N_WEBHOOK_URL: ${env:TF_N8N_WEBHOOK_URL}
+    events:
+      - s3:
+          bucket: ${env:TF_UPLOAD_BUCKET}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: uploads/
+            - suffix: .csv
+          existing: true   # bucket is owned by Terraform

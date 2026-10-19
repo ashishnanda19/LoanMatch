@@ -13,10 +13,13 @@ CREATE TABLE IF NOT EXISTS batches (
     batch_id      UUID        PRIMARY KEY,
     s3_key        TEXT,
     uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    row_count     INTEGER     NOT NULL DEFAULT 0,   -- rows inserted
-    skipped_rows  INTEGER     NOT NULL DEFAULT 0,   -- rows rejected by validation
+    row_count       INTEGER   NOT NULL DEFAULT 0,   -- users rows belonging to this batch
+    skipped_rows    INTEGER   NOT NULL DEFAULT 0,   -- rows rejected by validation
+    duplicate_rows  INTEGER   NOT NULL DEFAULT 0,   -- valid rows whose user_id already existed
+    -- webhook_failed = data landed in `users` but n8n could not be notified; the
+    -- batch can be replayed by re-POSTing {batch_id, row_count} to the webhook.
     status        TEXT        NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'processing', 'processed', 'failed'))
+                  CHECK (status IN ('pending', 'processing', 'processed', 'webhook_failed', 'failed'))
 );
 
 -- ---------------------------------------------------------------------------
