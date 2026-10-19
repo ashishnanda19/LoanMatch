@@ -1,0 +1,36 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.tfvars
+!*.tfvars.example
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+.terraform.lock.hcl.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+lambdas/**/package/
+lambdas/**/*.zip
+build/
+
+# n8n local data (credentials are stored encrypted here)
+n8n/data/
+n8n/.n8n/
+
+# Sample data (supplied separately by the assignment; not part of the repo)
+data/*
+!data/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
