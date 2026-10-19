@@ -1,0 +1,686 @@
+{
+  "id": "workflowA0000001",
+  "name": "A - Loan Product Discovery (crawler)",
+  "nodes": [
+    {
+      "id": "bea56da0-6db5-5a78-8a39-8f98eb22031a",
+      "name": "Daily schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 2
+            }
+          ]
+        }
+      },
+      "position": [
+        0,
+        160
+      ]
+    },
+    {
+      "id": "69aa1ced-49ff-504b-b399-1389b7ea85da",
+      "name": "Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        0,
+        360
+      ]
+    },
+    {
+      "id": "d1d7100b-9b97-550d-880c-99cbe6fee7c9",
+      "name": "Crawl now (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crawl-now",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "position": [
+        0,
+        560
+      ],
+      "webhookId": "crawl-now-webhook"
+    },
+    {
+      "id": "3ebb19e3-efd4-59f9-be1a-c195734ad9e5",
+      "name": "Seed sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Seed sources\"\n// The crawl targets. Adding a site = one more object here plus a table layout the\n// \"Parse lender tables\" node understands (header: Bank/Lender | Interest Rate | ...).\n// NOTE: policybazaar.com/personal-loan/* redirects to paisabazaar.com (same group), so it\n// is not a distinct source and is deliberately not listed.\nreturn [\n  { json: { source_site: 'paisabazaar', list_url: 'https://www.paisabazaar.com/personal-loan/interest-rates/' } },\n  { json: { source_site: 'bankbazaar', list_url: 'https://www.bankbazaar.com/personal-loan.html' } },\n];\n"
+      },
+      "position": [
+        240,
+        260
+      ]
+    },
+    {
+      "id": "bb7cc765-64ae-5cdf-a673-0951ba233e61",
+      "name": "Fetch list page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.list_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "position": [
+        480,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "83bb27d6-16ab-52a8-920d-230597b786ac",
+      "name": "Parse lender tables",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Parse lender tables\"  (mode: Run Once for All Items)\n//\n// Input : one item per list page, from \"Fetch list page\" (json.data = page HTML).\n// Output: one item per lender row found in the rate tables:\n//         { source_site, product_name, interest_rate, rate_text, max_amount_text,\n//           tenure_text, fee_text, detail_url }\n//\n// Deterministic on purpose: the rate tables are clean HTML, so an LLM here would only\n// add cost and the chance of hallucinated numbers.\n\nconst MAX_LENDERS_PER_SITE = 40; // safety valve against a layout change exploding the crawl\nconst out = [];\n\nconst ENT = { amp: '&', nbsp: ' ', quot: '\"', apos: \"'\", lt: '<', gt: '>', rupee: '₹' };\nconst decode = (s) =>\n  s\n    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))\n    .replace(/&#(\\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))\n    .replace(/&([a-z]+);/gi, (m, n) => (ENT[n.toLowerCase()] !== undefined ? ENT[n.toLowerCase()] : m));\nconst text = (h) => decode(h.replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim();\nconst stripNoise = (h) => h.replace(/<(script|style|noscript|svg)[\\s\\S]*?<\\/\\1>/gi, '');\n\n// \"9.99% onwards*\" -> 9.99 ; \"10.00% - 30.50%\" -> 10 (lowest advertised) ;\n// \"1.25% per month\" -> 15 (annualised, simple) ; \"Up to 36% p.a.\" -> 36\nfunction parseRate(t) {\n  const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*%/);\n  if (!m) return null;\n  let r = parseFloat(m[1]);\n  if (/per\\s*month|p\\.?\\s*m\\.?\\b/i.test(t)) r *= 12;\n  return Math.round(r * 100) / 100;\n}\n\n// Resolve a link against the page it was found on. Done by hand because n8n's Code-node\n// sandbox does not expose the URL global.\nfunction absoluteUrl(href, base) {\n  if (/^https?:\\/\\//i.test(href)) return href;\n  const origin = (base.match(/^https?:\\/\\/[^/]+/i) || [''])[0];\n  if (href.startsWith('//')) return base.split(':')[0] + ':' + href;\n  if (href.startsWith('/')) return origin + href;\n  return base.replace(/[^/]*$/, '') + href; // relative to the current \"directory\"\n}\n\nfunction normaliseName(n) {\n  n = n.replace(/\\s+/g, ' ').trim();\n  return /personal loan/i.test(n) ? n : `${n} Personal Loan`;\n}\n\n$input.all().forEach((inp, idx) => {\n  const { source_site, list_url } = $('Seed sources').itemMatching(idx).json;\n  const res = inp.json;\n  const html = res && typeof res.data === 'string' ? res.data : '';\n  if (!html || html.length < 5000) {\n    // Layout/fetch problem: record it and move on, never crash the whole crawl.\n    console.log(`[${source_site}] empty/short response (${html.length} bytes) - skipping site`);\n    return;\n  }\n\n  const tables = stripNoise(html).match(/<table[\\s\\S]*?<\\/table>/gi) || [];\n  const seen = new Set();\n  let count = 0;\n\n  for (const t of tables) {\n    const rows = t.match(/<tr[\\s\\S]*?<\\/tr>/gi) || [];\n    if (rows.length < 2) continue;\n    const header = (rows[0].match(/<t[hd][\\s\\S]*?<\\/t[hd]>/gi) || []).map(text);\n    const col = (re) => header.findIndex((h) => re.test(h));\n    const cName = col(/^(bank|lender)/i);\n    const cRate = col(/interest rate/i);\n    if (cName !== 0 || cRate < 0) continue; // not a lender rate table\n    const cAmt = col(/(max(imum)? )?loan amount/i);\n    const cTen = col(/tenure/i);\n    const cFee = col(/processing fee/i);\n\n    for (const r of rows.slice(1)) {\n      if (count >= MAX_LENDERS_PER_SITE) break;\n      const cellsHtml = r.match(/<t[hd][\\s\\S]*?<\\/t[hd]>/gi) || [];\n      if (cellsHtml.length <= cRate) continue;\n      const cells = cellsHtml.map(text);\n      const name = normaliseName(cells[0]);\n      if (!cells[0] || seen.has(name.toLowerCase())) continue;\n      const href = (cellsHtml[0].match(/href=\"([^\"]+)\"/i) || [])[1];\n      const detail_url = href ? absoluteUrl(decode(href), list_url) : null;\n      seen.add(name.toLowerCase());\n      count++;\n      out.push({\n        json: {\n          source_site,\n          product_name: name,\n          interest_rate: parseRate(cells[cRate]),\n          rate_text: cells[cRate],\n          max_amount_text: cAmt >= 0 ? cells[cAmt] || null : null,\n          tenure_text: cTen >= 0 ? cells[cTen] || null : null,\n          fee_text: cFee >= 0 ? cells[cFee] || null : null,\n          detail_url,\n        },\n      });\n    }\n  }\n  const noLink = out.filter((o) => o.json.source_site === source_site && !o.json.detail_url).length;\n  console.log(`[${source_site}] parsed ${count} lenders (${noLink} without a detail link)`);\n});\n\nreturn out;\n"
+      },
+      "position": [
+        720,
+        260
+      ]
+    },
+    {
+      "id": "9d07aa9e-a69c-5a4d-9a79-7cddd3c810fc",
+      "name": "Fetch lender page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.detail_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 400
+            }
+          }
+        }
+      },
+      "position": [
+        960,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "96fe3462-9c27-5145-ae59-4a96c69873e5",
+      "name": "Extract eligibility text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Extract eligibility text\"  (mode: Run Once for All Items)\n//\n// Input : one item per lender detail page, from \"Fetch lender page\"\n//         (json.data = HTML, or json.error if the fetch failed).\n// Output: the lender fields from \"Parse lender tables\" plus `eligibility_text`\n//         (<= ~2.5 KB: just the eligibility prose / key-facts table), so the LLM sees\n//         a few hundred tokens instead of an 800 KB page.\n\nconst MAX_CHARS = 2500;\n\nconst ENT = { amp: '&', nbsp: ' ', quot: '\"', apos: \"'\", lt: '<', gt: '>', rupee: '₹' };\nconst decode = (s) =>\n  s\n    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))\n    .replace(/&#(\\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))\n    .replace(/&([a-z]+);/gi, (m, n) => (ENT[n.toLowerCase()] !== undefined ? ENT[n.toLowerCase()] : m));\n// Block-level tags become sentence breaks so list items don't run together.\nconst text = (h) =>\n  decode(h.replace(/<\\/(li|p|tr|div|h[1-6])>|<br\\s*\\/?>/gi, '. ').replace(/<[^>]+>/g, ' '))\n    .replace(/\\s+/g, ' ')\n    .replace(/(\\.\\s*){2,}/g, '. ')\n    .trim();\nconst stripNoise = (h) => h.replace(/<(script|style|noscript|svg)[\\s\\S]*?<\\/\\1>/gi, '');\n\nfunction eligibilityFrom(html) {\n  const s = stripNoise(html);\n  const chunks = [];\n\n  // (a) key-facts tables, e.g. \"Minimum Income Required | Rs.15,000\"\n  for (const t of s.match(/<table[\\s\\S]*?<\\/table>/gi) || []) {\n    for (const r of t.match(/<tr[\\s\\S]*?<\\/tr>/gi) || []) {\n      const cells = (r.match(/<t[hd][\\s\\S]*?<\\/t[hd]>/gi) || []).map(text);\n      if (cells.length === 2 && /minimum (net )?(monthly )?(income|salary)|min\\.? (income|salary)|age limit|cibil|credit score/i.test(cells[0])) {\n        chunks.push(`${cells[0]}: ${cells[1]}`);\n      }\n    }\n  }\n\n  // (b) the prose under an \"Eligibility\" heading (first two matching sections).\n  // A section runs until the next heading of the same or higher level, so nested\n  // sub-headings (\"For salaried\", \"For self-employed\") stay part of it.\n  const parts = s.split(/(<h[1-4][^>]*>[\\s\\S]*?<\\/h[1-4]>)/i);\n  const level = (h) => parseInt(h.match(/<h([1-4])/i)[1], 10);\n  let found = 0;\n  for (let i = 1; i < parts.length - 1 && found < 2; i += 2) {\n    const heading = text(parts[i]);\n    if (!/eligib|who can apply|criteria/i.test(heading)) continue;\n    if (/top.?up|calculator|check your|how to/i.test(heading)) continue;\n    const L = level(parts[i]);\n    let body = text(parts[i + 1]);\n    let j = i + 2;\n    while (j < parts.length - 1 && level(parts[j]) > L) {\n      body += ` ${text(parts[j])}: ${text(parts[j + 1])}`;\n      j += 2;\n    }\n    if (body.length < 40) continue;\n    chunks.push(`${heading}: ${body}`);\n    found++;\n    i = j - 2; // resume after this section\n  }\n  return chunks.join('\\n').slice(0, MAX_CHARS);\n}\n\nreturn $input.all().map((item, i) => {\n  const src = $('Parse lender tables').itemMatching(i).json;\n  const html = item.json && typeof item.json.data === 'string' ? item.json.data : '';\n  const eligibility_text = html ? eligibilityFrom(html) : '';\n  if (!eligibility_text) console.log(`no eligibility text for ${src.source_site} / ${src.product_name}`);\n  return { json: { ...src, eligibility_text } };\n});\n"
+      },
+      "position": [
+        1200,
+        260
+      ]
+    },
+    {
+      "id": "85798df3-3b9c-5de6-b6d2-081bacf65fce",
+      "name": "Has eligibility text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "bee3d91a-295b-529b-b570-da8de115eb80",
+              "leftValue": "={{ !!$json.eligibility_text }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        1440,
+        260
+      ]
+    },
+    {
+      "id": "68d15728-ab20-5564-956b-76b5f64b74dc",
+      "name": "Skipped: no eligibility text",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        1680,
+        440
+      ]
+    },
+    {
+      "id": "c7993126-282e-59e5-ae6c-d18a0ba49df5",
+      "name": "Build LLM prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Build LLM prompt\"\n// Attaches the system + user prompt to each lender item. Both the Groq and the Gemini\n// request nodes read these fields, so the two providers see the identical prompt.\nconst SYSTEM = \"You extract personal-loan eligibility criteria from text scraped from an Indian lending website.\\nReturn ONLY a JSON object with exactly this shape:\\n{\\\"rules\\\":[{\\\"employment_types\\\":[\\\"Salaried\\\"],\\\"min_income\\\":null,\\\"min_credit_score\\\":null,\\\"min_age\\\":null,\\\"max_age\\\":null}],\\\"qualitative_criteria\\\":null}\\n\\nField rules:\\n- employment_types: array using only \\\"Salaried\\\", \\\"Self-Employed\\\", \\\"Business\\\".\\n  Salaried employees, government/PSU/defence employees -> \\\"Salaried\\\".\\n  Self-employed individuals or professionals (doctors, CAs, etc.) -> \\\"Self-Employed\\\".\\n  Business owners, proprietors, traders, MSMEs -> \\\"Business\\\".\\n  If the text names no applicant type at all, use all three.\\n- min_income: MINIMUM MONTHLY net income in INR as an integer. Convert annual figures to monthly (divide by 12). null if not stated.\\n- min_credit_score: minimum CIBIL / credit score (300-900), only if a number is explicitly stated, otherwise null. Never guess a typical value.\\n- min_age / max_age: applicant age in years. For max_age use the stated maximum even if it is \\\"at loan maturity\\\". null if not stated.\\n- If the criteria differ by applicant type (for example a different minimum income for salaried vs self-employed), output one rule per group. Otherwise output exactly ONE rule.\\n- qualitative_criteria: a short plain-English summary (max 300 characters) of requirements the numeric fields cannot express: work experience, employer category, city/residence, education, existing bank relationship, nationality, business vintage. null if there are none.\\n- Never invent numbers. When unsure, use null.\";\n\nreturn $input.all().map((item) => ({\n  json: {\n    ...item.json,\n    system_prompt: SYSTEM,\n    user_prompt: `Lender: ${item.json.product_name}\\n\\nEligibility text:\\n${item.json.eligibility_text}`,\n  },\n}));\n"
+      },
+      "position": [
+        1680,
+        200
+      ]
+    },
+    {
+      "id": "3cf03633-b45a-5878-979d-5d6dd346beaa",
+      "name": "Groq: extract criteria",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-loan-crawler/1.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-oss-120b', temperature: 0, reasoning_effort: 'low', max_completion_tokens: 800, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }] }) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 8000
+            }
+          }
+        }
+      },
+      "position": [
+        1920,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credGroq000000001",
+          "name": "Groq API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000
+    },
+    {
+      "id": "1e7027e7-a420-5202-b2d6-0430da064cda",
+      "name": "Validate groq output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Validate <provider> output\"  (mode: Run Once for All Items)\n// One source file; scripts/build_workflows.py stamps PROVIDER in for the Groq and Gemini copies.\n//\n// Input : raw HTTP responses from the LLM node (or error items if the call failed).\n// Output: the original lender item + `valid`, `extraction_status` and, when valid, the\n//         normalised fields that go into loan_products.\n//\n// The LLM is only trusted for *reading the text*. Everything structural is enforced here:\n// numeric ranges, employment-type vocabulary, duplicate-rule merging, and the derived\n// \"envelope\" columns used by the Stage 1 SQL pre-filter.\n\nconst PROVIDER = 'groq'; // 'groq' | 'gemini'\nconst TYPES = ['Salaried', 'Self-Employed', 'Business'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\n\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/); // tolerate prose around the object\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\n\nconst toInt = (v) => {\n  const n = typeof v === 'string' ? parseInt(v.replace(/[,₹\\s]|rs\\.?/gi, ''), 10) : v;\n  return Number.isInteger(n) ? n : null;\n};\nconst inRange = (v, lo, hi) => { const n = toInt(v); return n !== null && n >= lo && n <= hi ? n : null; };\n\nfunction normType(t) {\n  const s = String(t || '').toLowerCase().replace(/[\\s_]+/g, '-');\n  if (/^salaried|^employee/.test(s)) return 'Salaried';\n  if (/^self/.test(s)) return 'Self-Employed';\n  if (/^business|^proprietor|^msme|^trader/.test(s)) return 'Business';\n  return null;\n}\n\nfunction cleanRule(r) {\n  if (!r || typeof r !== 'object') return null;\n  let types = (Array.isArray(r.employment_types) ? r.employment_types : []).map(normType).filter(Boolean);\n  if (!types.length) types = TYPES.slice(); // text named no applicant type => applies to everyone\n  // Indian lenders use \"self-employed\" to cover business owners too (self-employed\n  // professionals AND self-employed non-professionals/businessmen). Our CSV splits them\n  // into two categories, so a lender that accepts one accepts the other.\n  if (types.includes('Self-Employed') && !types.includes('Business')) types.push('Business');\n  const rule = {\n    types: [...new Set(types)],\n    min_income: inRange(r.min_income, 3000, 1000000), // monthly INR\n    min_credit_score: inRange(r.min_credit_score, 300, 900),\n    min_age: inRange(r.min_age, 18, 80),\n    max_age: inRange(r.max_age, 18, 100),\n  };\n  if (rule.min_age !== null && rule.max_age !== null && rule.min_age > rule.max_age) {\n    rule.min_age = null; rule.max_age = null; // contradictory => don't trust either\n  }\n  return rule;\n}\n\nconst minNN = (a) => { const v = a.filter((x) => x !== null); return v.length ? Math.min(...v) : null; };\nconst maxNN = (a) => { const v = a.filter((x) => x !== null); return v.length ? Math.max(...v) : null; };\n\n// Several rules may cover the same employment type (LLM split by sub-category, or\n// repeated itself). Collapse to ONE permissive rule per type, then regroup types that\n// ended up identical, so rules never overlap.\nfunction mergeRules(rules) {\n  const perType = {};\n  for (const t of TYPES) {\n    const rs = rules.filter((r) => r.types.includes(t));\n    if (!rs.length) continue;\n    perType[t] = {\n      min_income: minNN(rs.map((r) => r.min_income)),\n      min_credit_score: minNN(rs.map((r) => r.min_credit_score)),\n      min_age: minNN(rs.map((r) => r.min_age)),\n      max_age: maxNN(rs.map((r) => r.max_age)),\n    };\n  }\n  const groups = new Map();\n  for (const t of Object.keys(perType)) {\n    const k = JSON.stringify(perType[t]);\n    if (!groups.has(k)) groups.set(k, { employment_types: [], ...perType[t] });\n    groups.get(k).employment_types.push(t);\n  }\n  return [...groups.values()];\n}\n\n// Envelope = a SUPERSET of every rule, so the SQL pre-filter can never drop a user who\n// qualifies under any rule. A null in any rule (= unstated) forces the envelope to null.\nfunction envelope(rules) {\n  const all = (k) => rules.map((r) => r[k]);\n  const anyNull = (k) => all(k).some((v) => v === null);\n  return {\n    min_income: anyNull('min_income') ? null : Math.min(...all('min_income')),\n    min_credit_score: anyNull('min_credit_score') ? null : Math.min(...all('min_credit_score')),\n    min_age: anyNull('min_age') ? null : Math.min(...all('min_age')),\n    max_age: anyNull('max_age') ? null : Math.max(...all('max_age')),\n    allowed_employment_types: TYPES.filter((t) => rules.some((r) => r.employment_types.includes(t))),\n  };\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build LLM prompt').itemMatching(i).json; // follows paired-item lineage\n  const fail = (why) => ({ json: { ...original, valid: false, extraction_status: `invalid_${PROVIDER}`, llm_error: why } });\n\n  if (item.json && item.json.error) return fail(`request failed: ${JSON.stringify(item.json.error).slice(0, 200)}`);\n  const parsed = parseJson(responseText(item.json));\n  if (!parsed || !Array.isArray(parsed.rules) || parsed.rules.length === 0) return fail('response was not the expected JSON');\n\n  const cleaned = parsed.rules.map(cleanRule).filter(Boolean);\n  if (!cleaned.length) return fail('no usable rules');\n  const rules = mergeRules(cleaned);\n\n  let q = typeof parsed.qualitative_criteria === 'string' ? parsed.qualitative_criteria.trim() : null;\n  if (q && (q.length < 3 || /^(null|none|n\\/a)$/i.test(q))) q = null;\n  if (q && q.length > 400) q = q.slice(0, 397) + '...';\n\n  return {\n    json: {\n      ...original,\n      valid: true,\n      extraction_status: `llm_${PROVIDER}`,\n      ...envelope(rules),\n      eligibility_rules: rules,\n      qualitative_criteria_text: q,\n      raw_criteria_text: (original.eligibility_text || '').slice(0, 2000),\n    },\n  };\n});\n"
+      },
+      "position": [
+        2160,
+        200
+      ]
+    },
+    {
+      "id": "29b5deea-6542-56d0-97f4-f776fd63ba71",
+      "name": "Groq output valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "2d96feda-620b-582e-a515-9e4b15a029c1",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        2400,
+        200
+      ]
+    },
+    {
+      "id": "19dd9fc4-2b76-55bc-a051-9ed27548ceab",
+      "name": "Gemini fallback: extract criteria",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } } }) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 7000
+            }
+          }
+        }
+      },
+      "position": [
+        2640,
+        360
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credGemini0000001",
+          "name": "Gemini API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 15000
+    },
+    {
+      "id": "9afb3d41-9905-51d8-a66f-941fc1cad87c",
+      "name": "Validate gemini output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Validate <provider> output\"  (mode: Run Once for All Items)\n// One source file; scripts/build_workflows.py stamps PROVIDER in for the Groq and Gemini copies.\n//\n// Input : raw HTTP responses from the LLM node (or error items if the call failed).\n// Output: the original lender item + `valid`, `extraction_status` and, when valid, the\n//         normalised fields that go into loan_products.\n//\n// The LLM is only trusted for *reading the text*. Everything structural is enforced here:\n// numeric ranges, employment-type vocabulary, duplicate-rule merging, and the derived\n// \"envelope\" columns used by the Stage 1 SQL pre-filter.\n\nconst PROVIDER = 'gemini'; // 'groq' | 'gemini'\nconst TYPES = ['Salaried', 'Self-Employed', 'Business'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\n\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/); // tolerate prose around the object\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\n\nconst toInt = (v) => {\n  const n = typeof v === 'string' ? parseInt(v.replace(/[,₹\\s]|rs\\.?/gi, ''), 10) : v;\n  return Number.isInteger(n) ? n : null;\n};\nconst inRange = (v, lo, hi) => { const n = toInt(v); return n !== null && n >= lo && n <= hi ? n : null; };\n\nfunction normType(t) {\n  const s = String(t || '').toLowerCase().replace(/[\\s_]+/g, '-');\n  if (/^salaried|^employee/.test(s)) return 'Salaried';\n  if (/^self/.test(s)) return 'Self-Employed';\n  if (/^business|^proprietor|^msme|^trader/.test(s)) return 'Business';\n  return null;\n}\n\nfunction cleanRule(r) {\n  if (!r || typeof r !== 'object') return null;\n  let types = (Array.isArray(r.employment_types) ? r.employment_types : []).map(normType).filter(Boolean);\n  if (!types.length) types = TYPES.slice(); // text named no applicant type => applies to everyone\n  // Indian lenders use \"self-employed\" to cover business owners too (self-employed\n  // professionals AND self-employed non-professionals/businessmen). Our CSV splits them\n  // into two categories, so a lender that accepts one accepts the other.\n  if (types.includes('Self-Employed') && !types.includes('Business')) types.push('Business');\n  const rule = {\n    types: [...new Set(types)],\n    min_income: inRange(r.min_income, 3000, 1000000), // monthly INR\n    min_credit_score: inRange(r.min_credit_score, 300, 900),\n    min_age: inRange(r.min_age, 18, 80),\n    max_age: inRange(r.max_age, 18, 100),\n  };\n  if (rule.min_age !== null && rule.max_age !== null && rule.min_age > rule.max_age) {\n    rule.min_age = null; rule.max_age = null; // contradictory => don't trust either\n  }\n  return rule;\n}\n\nconst minNN = (a) => { const v = a.filter((x) => x !== null); return v.length ? Math.min(...v) : null; };\nconst maxNN = (a) => { const v = a.filter((x) => x !== null); return v.length ? Math.max(...v) : null; };\n\n// Several rules may cover the same employment type (LLM split by sub-category, or\n// repeated itself). Collapse to ONE permissive rule per type, then regroup types that\n// ended up identical, so rules never overlap.\nfunction mergeRules(rules) {\n  const perType = {};\n  for (const t of TYPES) {\n    const rs = rules.filter((r) => r.types.includes(t));\n    if (!rs.length) continue;\n    perType[t] = {\n      min_income: minNN(rs.map((r) => r.min_income)),\n      min_credit_score: minNN(rs.map((r) => r.min_credit_score)),\n      min_age: minNN(rs.map((r) => r.min_age)),\n      max_age: maxNN(rs.map((r) => r.max_age)),\n    };\n  }\n  const groups = new Map();\n  for (const t of Object.keys(perType)) {\n    const k = JSON.stringify(perType[t]);\n    if (!groups.has(k)) groups.set(k, { employment_types: [], ...perType[t] });\n    groups.get(k).employment_types.push(t);\n  }\n  return [...groups.values()];\n}\n\n// Envelope = a SUPERSET of every rule, so the SQL pre-filter can never drop a user who\n// qualifies under any rule. A null in any rule (= unstated) forces the envelope to null.\nfunction envelope(rules) {\n  const all = (k) => rules.map((r) => r[k]);\n  const anyNull = (k) => all(k).some((v) => v === null);\n  return {\n    min_income: anyNull('min_income') ? null : Math.min(...all('min_income')),\n    min_credit_score: anyNull('min_credit_score') ? null : Math.min(...all('min_credit_score')),\n    min_age: anyNull('min_age') ? null : Math.min(...all('min_age')),\n    max_age: anyNull('max_age') ? null : Math.max(...all('max_age')),\n    allowed_employment_types: TYPES.filter((t) => rules.some((r) => r.employment_types.includes(t))),\n  };\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build LLM prompt').itemMatching(i).json; // follows paired-item lineage\n  const fail = (why) => ({ json: { ...original, valid: false, extraction_status: `invalid_${PROVIDER}`, llm_error: why } });\n\n  if (item.json && item.json.error) return fail(`request failed: ${JSON.stringify(item.json.error).slice(0, 200)}`);\n  const parsed = parseJson(responseText(item.json));\n  if (!parsed || !Array.isArray(parsed.rules) || parsed.rules.length === 0) return fail('response was not the expected JSON');\n\n  const cleaned = parsed.rules.map(cleanRule).filter(Boolean);\n  if (!cleaned.length) return fail('no usable rules');\n  const rules = mergeRules(cleaned);\n\n  let q = typeof parsed.qualitative_criteria === 'string' ? parsed.qualitative_criteria.trim() : null;\n  if (q && (q.length < 3 || /^(null|none|n\\/a)$/i.test(q))) q = null;\n  if (q && q.length > 400) q = q.slice(0, 397) + '...';\n\n  return {\n    json: {\n      ...original,\n      valid: true,\n      extraction_status: `llm_${PROVIDER}`,\n      ...envelope(rules),\n      eligibility_rules: rules,\n      qualitative_criteria_text: q,\n      raw_criteria_text: (original.eligibility_text || '').slice(0, 2000),\n    },\n  };\n});\n"
+      },
+      "position": [
+        2880,
+        360
+      ]
+    },
+    {
+      "id": "a48dd30e-39a0-50d1-a65f-084ae2c3c6f9",
+      "name": "Gemini output valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c08de5e8-7f52-571a-b1f3-cebac9927791",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        3120,
+        360
+      ]
+    },
+    {
+      "id": "401e6c46-fc5a-5665-9c0e-a0aba1f7d111",
+      "name": "Dropped: both LLMs failed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        3360,
+        480
+      ]
+    },
+    {
+      "id": "df97863b-5809-5f90-904a-a71a556bcd90",
+      "name": "Upsert loan product",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO loan_products\n  (source_site, product_name, interest_rate, min_income, min_credit_score, min_age, max_age,\n   allowed_employment_types, eligibility_rules, raw_criteria_text, qualitative_criteria_text, last_crawled_at)\nSELECT r->>'source_site', r->>'product_name', (r->>'interest_rate')::numeric,\n       (r->>'min_income')::int, (r->>'min_credit_score')::int, (r->>'min_age')::int, (r->>'max_age')::int,\n       CASE WHEN jsonb_typeof(r->'allowed_employment_types') = 'array'\n            THEN ARRAY(SELECT jsonb_array_elements_text(r->'allowed_employment_types')) END,\n       CASE WHEN jsonb_typeof(r->'eligibility_rules') = 'array' THEN r->'eligibility_rules' END,\n       r->>'raw_criteria_text', r->>'qualitative_criteria_text', now()\nFROM (SELECT $1::jsonb AS r) x\nON CONFLICT (source_site, product_name) DO UPDATE SET\n  interest_rate = EXCLUDED.interest_rate, min_income = EXCLUDED.min_income,\n  min_credit_score = EXCLUDED.min_credit_score, min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age,\n  allowed_employment_types = EXCLUDED.allowed_employment_types, eligibility_rules = EXCLUDED.eligibility_rules,\n  raw_criteria_text = EXCLUDED.raw_criteria_text, qualitative_criteria_text = EXCLUDED.qualitative_criteria_text,\n  last_crawled_at = now()\nRETURNING product_id, source_site, product_name, interest_rate, allowed_employment_types, last_crawled_at",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify({ source_site: $json.source_site, product_name: $json.product_name, interest_rate: $json.interest_rate, min_income: $json.min_income, min_credit_score: $json.min_credit_score, min_age: $json.min_age, max_age: $json.max_age, allowed_employment_types: $json.allowed_employment_types, eligibility_rules: $json.eligibility_rules, raw_criteria_text: $json.raw_criteria_text, qualitative_criteria_text: $json.qualitative_criteria_text }) ] }}"
+        }
+      },
+      "position": [
+        3600,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      }
+    },
+    {
+      "id": "87584d70-0a1a-5d9f-a8ec-55e0af836c77",
+      "name": "Crawl summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Crawl summary\"  (runs once, after every upsert has finished)\n// Only ancestors of this node can be read with $(...); the skipped/dropped NoOp branches\n// are siblings, so derive their counts from ancestors instead.\nconst hasText = $('Extract eligibility text').all().filter((i) => i.json.eligibility_text);\nconst totalLenders = $('Extract eligibility text').all().length;\nconst rows = $input.all().map((i) => i.json);\nconst by = {};\nrows.forEach((r) => { by[r.source_site] = (by[r.source_site] || 0) + 1; });\n\nreturn [{\n  json: {\n    upserted_products: rows.length,\n    upserted_by_site: by,\n    lenders_found: totalLenders,\n    skipped_no_eligibility_text: totalLenders - hasText.length,\n    dropped_llm_failed: hasText.length - rows.length,\n    finished_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "position": [
+        3840,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Daily schedule": {
+      "main": [
+        [
+          {
+            "node": "Seed sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Seed sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crawl now (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Seed sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Seed sources": {
+      "main": [
+        [
+          {
+            "node": "Fetch list page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch list page": {
+      "main": [
+        [
+          {
+            "node": "Parse lender tables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse lender tables": {
+      "main": [
+        [
+          {
+            "node": "Fetch lender page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch lender page": {
+      "main": [
+        [
+          {
+            "node": "Extract eligibility text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract eligibility text": {
+      "main": [
+        [
+          {
+            "node": "Has eligibility text?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has eligibility text?": {
+      "main": [
+        [
+          {
+            "node": "Build LLM prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped: no eligibility text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM prompt": {
+      "main": [
+        [
+          {
+            "node": "Groq: extract criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: extract criteria": {
+      "main": [
+        [
+          {
+            "node": "Validate groq output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate groq output": {
+      "main": [
+        [
+          {
+            "node": "Groq output valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq output valid?": {
+      "main": [
+        [
+          {
+            "node": "Upsert loan product",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini fallback: extract criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini fallback: extract criteria": {
+      "main": [
+        [
+          {
+            "node": "Validate gemini output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate gemini output": {
+      "main": [
+        [
+          {
+            "node": "Gemini output valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini output valid?": {
+      "main": [
+        [
+          {
+            "node": "Upsert loan product",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dropped: both LLMs failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert loan product": {
+      "main": [
+        [
+          {
+            "node": "Crawl summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 3600
+  },
+  "pinData": {}
+}
