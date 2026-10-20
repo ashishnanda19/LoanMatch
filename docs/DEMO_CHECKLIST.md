@@ -40,7 +40,7 @@
 
 ## D. After the demo
 
-- [ ] Make sure the repo is **private** and the four collaborators are invited (see README section 7).
+- [ ] Make sure the repo is **private** and the four collaborators are invited.
 - [ ] Rotate the Groq and Gemini API keys.
 - [ ] `terraform -chdir=infra destroy` to stop AWS charges (RDS, EC2 and the Elastic IP bill by the hour).
 - [ ] Delete the stray `TEST - Gemini fallback` and `DIAG - LLM probe` workflows from the n8n editor if the instance is kept.
