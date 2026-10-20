@@ -2,8 +2,9 @@
 -- the stale employment types grouped, so one LLM call covers all of them.
 --   scope 'used': only (lender, employment type) pairs that appear in this batch's matches
 --   scope 'all' : every fresh lender
--- criteria_hash covers the qualitative text, the source text the model sees and a prompt-version
--- tag ('rv4'): unchanged crawl data returns ZERO rows => zero LLM calls.
+-- criteria_hash = md5(prompt version 'rv5' + the lender's RAW page text). It deliberately excludes the
+-- LLM-written summary (qualitative_criteria_text): that summary varies slightly on every crawl even when
+-- the page is identical, which used to trigger needless re-reviews. Same page => same hash => ZERO rows.
 -- $1 = scope, $2 = batch_id or ''
 WITH used AS (
     SELECT DISTINCT m.product_id, u.employment_status AS employment_type
@@ -12,7 +13,7 @@ WITH used AS (
     WHERE $1 = 'used' AND u.batch_id = NULLIF($2, '')::uuid
 ), segs AS (
     SELECT p.product_id, p.product_name, p.qualitative_criteria_text, p.raw_criteria_text, t.employment_type,
-           md5('rv4|' || p.qualitative_criteria_text || E'\n' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash
+           md5('rv5|' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash
     FROM loan_products p
     CROSS JOIN LATERAL unnest(COALESCE(p.allowed_employment_types, ARRAY['Salaried', 'Self-Employed', 'Business'])) AS t(employment_type)
     WHERE p.last_crawled_at > now() - interval '7 days'

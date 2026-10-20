@@ -2,7 +2,7 @@
 -- Grouping by user_id (not email: emails repeat across users) means each person gets exactly
 -- one email. The recipient comes from test_recipients only; users.email is never selected, so
 -- real CSV addresses cannot be mailed. Users without a test_recipients row are skipped.
--- The qualitative caveat is attached only when it was written for the CURRENT criteria text.
+-- The qualitative caveat is attached only when it was written for the CURRENT page text (same key as R).
 -- $1 = batch_id, or '' for every pending match
 SELECT u.user_id,
        u.name,
@@ -27,7 +27,7 @@ JOIN loan_products p    ON p.product_id = m.product_id
 LEFT JOIN qualitative_reviews r
        ON r.product_id = m.product_id
       AND r.employment_type = u.employment_status
-      AND r.criteria_hash = md5('rv4|' || p.qualitative_criteria_text || E'\n' || COALESCE(p.raw_criteria_text, ''))
+      AND r.criteria_hash = md5('rv5|' || COALESCE(p.raw_criteria_text, ''))
 WHERE m.notified_at IS NULL
   AND (NULLIF($1, '') IS NULL OR u.batch_id = NULLIF($1, '')::uuid)
 GROUP BY u.user_id, u.name, u.credit_score, tr.recipient_email

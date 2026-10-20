@@ -8,7 +8,7 @@ WITH used AS (
     WHERE $1 = 'used' AND u.batch_id = NULLIF($2, '')::uuid
 ), segs AS (
     SELECT p.product_id, p.product_name, p.qualitative_criteria_text, p.raw_criteria_text, t.employment_type,
-           md5('rv4|' || p.qualitative_criteria_text || E'\n' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash
+           md5('rv5|' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash
     FROM loan_products p
     CROSS JOIN LATERAL unnest(COALESCE(p.allowed_employment_types, ARRAY['Salaried', 'Self-Employed', 'Business'])) AS t(employment_type)
     WHERE p.last_crawled_at > now() - interval '7 days'

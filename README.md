@@ -23,15 +23,17 @@ One picture of the whole system: the AWS side, the five n8n workflows (A, B, R, 
 
 ![Architecture: browser, API Gateway, Lambdas, S3, RDS, SES and the five n8n workflows](docs/architecture.png)
 
-**Reading it:** the numbers 1-11 are what happens on every upload. Thin arrows are data, thick arrows are workflow
+**Reading it (workflows A, B, R, C and E are the green boxes):** the numbers 1-11 are what happens on every upload. Thin arrows are data, thick arrows are workflow
 hand-offs (B waits for R, then starts C), and the dotted arrow is the refresh after a crawl. Workflow A runs on its own
 schedule and keeps the lender data fresh. A, B, R and C read and write the same RDS database; E mails the owner whenever one of them fails.
 
-- Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open it at [excalidraw.com](https://excalidraw.com) via *File, Open*)
-- Regenerate the picture: `npm i roughjs && node scripts/build_architecture.cjs` (layout lives in that one file)
+- Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open it at [excalidraw.com](https://excalidraw.com) via *File, Open*; each box, its logo and its text are grouped)
+- Regenerate the picture: `npm i roughjs && node scripts/build_architecture.cjs` (layout lives in that one file). Service logos are in `docs/icons/` and belong to their owners; they are used only to identify the services.
 
-<details>
-<summary>Mermaid version of the same diagram (kept as a fallback; also in <a href="docs/architecture.mmd"><code>docs/architecture.mmd</code></a>)</summary>
+### Mermaid version
+
+The same diagram as Mermaid text (renders on GitHub; source in [`docs/architecture.mmd`](docs/architecture.mmd)). It is
+kept next to the picture above so either can be used.
 
 ```mermaid
 flowchart TB
@@ -91,8 +93,6 @@ flowchart TB
     E -->|"alert mail to the owner"| SES
 ```
 
-</details>
-
 ### The five workflows
 
 | | Workflow | Triggers | What it does | Nodes |
@@ -142,7 +142,7 @@ The LLM reads lender web text twice, both times per lender and never per user:
 | Cost control | Effect |
 |---|---|
 | One call per lender, not per employment type | the prompt and lender text are sent once; 87 notes need only 36 calls |
-| Cached by `md5(prompt version + lender text)` | unchanged lender → **0 calls**; only changed lenders are re-reviewed |
+| Cached by `md5(prompt version + the lender's raw page text)` | unchanged page → **0 calls**; the key deliberately excludes the LLM-written summary, which varies on every crawl even for an identical page |
 | Notes for matched lenders first | after an upload, R reviews only the lender + employment-type pairs in that batch's matches (17 segments for the test batch, 12 already cached), and the emails wait for exactly those |
 | Everything else in the background | A asks R for all lenders after each crawl, so the cache is complete before any outlier user needs it |
 | Saved after every batch of 6 | a restart or a rate limit loses at most one batch |

@@ -14,7 +14,7 @@ CONN="host=$(terraform -chdir=infra output -raw db_host) dbname=$(terraform -chd
 read -r -d '' SQL <<'SQL' || true
 WITH seg AS (
   SELECT p.product_id, t.employment_type,
-         md5('rv4|' || p.qualitative_criteria_text || E'\n' || coalesce(p.raw_criteria_text, '')) AS h
+         md5('rv5|' || coalesce(p.raw_criteria_text, '')) AS h
   FROM loan_products p
   CROSS JOIN LATERAL unnest(coalesce(p.allowed_employment_types, ARRAY['Salaried','Self-Employed','Business'])) AS t(employment_type)
   WHERE p.last_crawled_at > now() - interval '7 days' AND p.qualitative_criteria_text IS NOT NULL
