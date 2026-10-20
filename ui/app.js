@@ -34,6 +34,7 @@
   const fmt = (n) => (n == null ? '–' : Number(n).toLocaleString('en-US'));
   const inr = (n) => '₹' + Number(n).toLocaleString('en-IN');
   const pct = (r) => (r == null ? '–' : Number(r).toFixed(2) + '%');
+  const ageRange = (lo, hi) => (lo && hi ? `${lo} to ${hi}` : lo ? `${lo}+` : hi ? `up to ${hi}` : '–');
   const palette = ['#295BEE', '#12296B', '#0a8a43', '#7c3aed', '#c2410c', '#0e7490', '#be185d', '#4d7c0f'];
   const colourFor = (s) => palette[[...s].reduce((a, c) => a + c.charCodeAt(0), 0) % palette.length];
   const initials = (s) => s.replace(/[^A-Za-z ]/g, '').split(' ').filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
@@ -163,7 +164,7 @@
         out.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (err) { out.replaceChildren(errorBox(err.message)); }
     } },
-      h('div', { class: 'fields' }, num('inc', 'Monthly income (₹)', '60000', 0, 10000000, 'Net monthly income'), num('scr', 'Credit score', '700', 300, 900, 'CIBIL-style score, 300 to 900'), num('age', 'Age', '35', 18, 100)),
+      h('div', { class: 'fields' }, num('inc', 'Monthly income (₹)', '60000', 0, 10000000, 'Net monthly income'), num('scr', 'Credit score', '700', 300, 900, 'CIBIL-style score, 300 to 900'), num('age', 'Age', '35', 18, 100, 'Years, 18 to 100')),
       h('div', { class: 'field' }, h('span', { style: 'font-size:.85rem;font-weight:500;color:var(--navy)' }, 'Employment type'), pills),
       h('button', { class: 'btn btn-navy', type: 'submit', style: 'justify-self:start' }, 'Find my offers →'));
     app.replaceChildren(h('div', { class: 'page' },
@@ -180,7 +181,7 @@
       body.replaceChildren(...all.filter((l) => l.lender.toLowerCase().includes(term)).map((l) => h('tr', null,
         h('td', null, h('b', null, l.lender), h('div', { class: 'hint' }, l.source_site)), h('td', { class: 'num' }, pct(l.rate)),
         h('td', null, (l.types || []).join(', ')), h('td', null, l.min_credit_score ? String(l.min_credit_score) : 'Not published'),
-        h('td', null, l.min_age || l.max_age ? `${l.min_age ?? '–'} to ${l.max_age ?? '–'}` : '–'))));
+        h('td', null, ageRange(l.min_age, l.max_age)))));
     };
     q.addEventListener('input', render);
     app.replaceChildren(h('div', { class: 'page' },
@@ -287,7 +288,7 @@
       try {
         const { users } = await api('/users?q=' + encodeURIComponent(term), { auth: true });
         list.replaceChildren(...(users.length ? users.map((u) => h('button', { class: 'person', 'aria-pressed': 'false', onclick: (e) => { list.querySelectorAll('.person').forEach((b) => b.setAttribute('aria-pressed', 'false')); e.currentTarget.setAttribute('aria-pressed', 'true'); open(u.user_id); } },
-          u.name, h('small', null, u.employment_status))) : [h('div', { class: 'empty' }, 'No customer matches that search.')]));
+          u.name, h('small', null, [u.employment_status, u.monthly_income != null ? inr(u.monthly_income) : null, u.credit_score != null ? 'score ' + u.credit_score : null, u.age != null ? 'age ' + u.age : null].filter(Boolean).join(' · ')))) : [h('div', { class: 'empty' }, 'No customer matches that search.')]));
         if (users.length === 1) { list.firstChild.click(); }
       } catch (e) { list.replaceChildren(errorBox(e.message)); }
     }

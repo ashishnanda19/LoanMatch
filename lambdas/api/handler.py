@@ -144,10 +144,11 @@ def find_users(query):
     if len(q) < 2:
         return respond(400, {"error": "type at least 2 characters"})
     if re.fullmatch(r"[0-9a-fA-F-]{36}", q):
-        data = rows("SELECT user_id, name, employment_status FROM users WHERE user_id = CAST(:q AS uuid)", q=q)
+        data = rows("SELECT user_id, name, employment_status, monthly_income, credit_score, age FROM users WHERE user_id = CAST(:q AS uuid)", q=q)
     else:
         like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        data = rows("SELECT user_id, name, employment_status FROM users WHERE name ILIKE :q ORDER BY name LIMIT 8", q=like)
+        data = rows("SELECT user_id, name, employment_status, monthly_income, credit_score, age FROM users WHERE name ILIKE :q "
+                    "ORDER BY name, monthly_income LIMIT 12", q=like)
     return respond(200, {"users": data})
 
 
