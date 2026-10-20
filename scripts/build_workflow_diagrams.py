@@ -14,18 +14,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = [  # (file, letter, heading, direction, one-line summary)
     ("A_loan_product_discovery.json", "A", "Loan Product Discovery (the crawler)", "TD",
-     "Three triggers, three lender sources. The rate table is parsed without an LLM; each lender's page is cut down "
-     "to its eligibility facts; Groq extracts numeric rules, Gemini is the fallback, and invalid answers are dropped."),
+     "Rates come from the list page without an LLM. Each lender page is cut down to its eligibility text, Groq extracts the rules, and Gemini is the fallback."),
     ("B_user_loan_matching.json", "B", "User-Loan Matching (the multi-stage filter)", "TD",
-     "Called by the parse-csv Lambda. Reconciles lenders, then SQL stages shrink 450,000 user-lender pairs to a top 5 per user. "
-     "No LLM. Then it asks R for notes (and waits) and starts C."),
+     "Called by the parse-csv Lambda. SQL stages cut 450,000 user-lender pairs to a top 5 per user, then R and C run."),
     ("R_lender_notes.json", "R", "Lender Notes (the cached LLM reviews)", "TD",
-     "One LLM call per lender, only when the lender's text changed (content-hash cache). Groq and Gemini lanes, "
-     "results saved every 6 lenders."),
+     "One LLM call per lender, only when its page text changed. Groq and Gemini lanes, saved every 6 lenders."),
     ("C_match_notifications.json", "C", "Match Notifications (SES)", "TD",
-     "One email per user to a test alias, marked as sent only after SES accepts, so failures retry and a second run sends nothing."),
+     "One email per user to a test alias, marked sent only after SES accepts."),
     ("E_failure_alerts.json", "E", "Failure Alerts (the error workflow)", "LR",
-     "n8n starts this when A, B, C or R fails, and emails the owner the workflow, node and error."),
+     "Started by n8n when A, B, C or R fails. Emails the owner the workflow, node and error."),
 ]
 TRIGGERS = {"scheduleTrigger", "manualTrigger", "webhook", "executeWorkflowTrigger", "errorTrigger"}
 BRANCH_LABELS = {"if": ["yes", "no"], "splitInBatches": ["done", "next lender"]}
@@ -78,11 +75,10 @@ def mermaid(wf: dict, direction: str) -> str:
 
 def section() -> str:
     out = [
-        "Each diagram is generated from the workflow's exported JSON by "
-        "[`scripts/build_workflow_diagrams.py`](scripts/build_workflow_diagrams.py), so it always matches what is in "
-        "[`n8n/workflows/`](n8n/workflows). "
-        "Blue rounded = trigger, yellow cylinder = database (SQL), green slanted = external call (LLM, web, SES), "
-        "double-bordered = another workflow, diamond = decision, plain box = Code node.",
+        "Generated from the exported workflow JSON by "
+        "[`scripts/build_workflow_diagrams.py`](scripts/build_workflow_diagrams.py), so it matches "
+        "[`n8n/workflows/`](n8n/workflows). Blue rounded: trigger. Yellow cylinder: SQL. Green slanted: external call "
+        "(LLM, web, SES). Double border: another workflow. Diamond: decision. Plain box: Code node.",
         "",
     ]
     for fname, letter, title, direction, summary in WORKFLOWS:

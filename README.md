@@ -1,39 +1,28 @@
 # Loan Eligibility Engine
 
-Upload a CSV of users → crawl personal-loan products from the web → match every user to the lenders
-they qualify for → email each user their best matches.
-
-Built for the ClickPe engineering-internship assignment on **AWS (ap-south-1)** and a **self-hosted n8n**.
-Everything is provisioned with Terraform, and the numbers below come from a real run on the supplied
-10,000-user dataset.
+Upload a CSV of users, crawl personal-loan products from the web, match each user to the lenders they qualify for, and email their best five. Built for the ClickPe engineering-internship assignment on AWS (ap-south-1) with a self-hosted n8n. The numbers below come from a real run on the supplied 10,000-user file.
 
 | | |
 |---|---|
-| Users matched | **10,000** in **~17 s** (workflow B), upload → email in **~23 s** |
-| Naive approach | 10,000 users × 45 lender records = **450,000** pairs |
-| LLM calls in the matching path | **0** (naive LLM approach: 450,000) |
-| LLM calls overall | one pass of **36** (one per lender, cached; unchanged lenders cost 0) |
-| What each user gets | their **top 5** lenders, lowest rate first, with a credit-score check and lender conditions |
+| Users matched | 10,000 in about 18 s (workflow B); upload to email in about 20 s |
+| Naive approach | 10,000 users x 45 lender records = 450,000 pairs |
+| LLM calls while matching | 0 (a per-pair LLM approach would need 450,000) |
+| LLM calls overall | one per lender, cached; an unchanged lender costs 0 |
+| Each user gets | their top 5 lenders, lowest rate first, with a credit-score check and the lender's conditions |
 
 ---
 
 ## 1. Architecture
 
-One picture of the whole system: the AWS side, the five n8n workflows (A, B, R, C and the failure-alert workflow E) and how they hand off.
-
 ![Architecture: browser, API Gateway, Lambdas, S3, RDS, SES and the five n8n workflows](docs/architecture.png)
 
-**Reading it (workflows A, B, R, C and E are the green boxes):** the numbers 1-11 are what happens on every upload. Thin arrows are data, thick arrows are workflow
-hand-offs (B waits for R, then starts C), and the dotted arrow is the refresh after a crawl. Workflow A runs on its own
-schedule and keeps the lender data fresh. A, B, R and C read and write the same RDS database; E mails the owner whenever one of them fails.
+Numbers 1-11 are one upload. The browser gets a presigned URL from API Gateway, uploads the CSV straight to S3, and S3 triggers the parse-csv Lambda. That loads RDS and calls workflow B, which matches the users, waits for workflow R (lender notes), then starts workflow C to send the emails through SES. Workflow A runs daily and refreshes the lender data. Workflow E emails the owner when A, B, C or R fails.
 
-- Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open it at [excalidraw.com](https://excalidraw.com) via *File, Open*; each box, its logo and its text are grouped)
-- Regenerate the picture: `npm i roughjs && node scripts/build_architecture.cjs` (layout lives in that one file). Service logos are in `docs/icons/` and belong to their owners; they are used only to identify the services.
+Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open it at excalidraw.com). To regenerate the picture: `npm i roughjs && node scripts/build_architecture.cjs`. The logos in `docs/icons/` belong to their owners and are only used to identify the services.
 
 ### Mermaid version
 
-The same diagram as Mermaid text (renders on GitHub; source in [`docs/architecture.mmd`](docs/architecture.mmd)). It is
-kept next to the picture above so either can be used.
+Same diagram as text, so it renders on GitHub. Source: [`docs/architecture.mmd`](docs/architecture.mmd).
 
 ```mermaid
 flowchart TB
@@ -96,21 +85,21 @@ flowchart TB
 
 | | Workflow | Triggers | What it does | Nodes |
 |---|---|---|---|---|
-| **A** | Loan Product Discovery | schedule 02:00 daily, manual, `POST /webhook/crawl-now` | Reads three sources, pulls each lender's eligibility text, has an LLM turn it into per-employment-type numeric rules, upserts `loan_products`, then hands off to R | 22 |
-| **B** | User-Loan Matching | `POST /webhook/batch-ready` (called by the parse-csv Lambda) | Multi-stage SQL funnel that matches 10,000 users and keeps each user's top 5. No LLM. Then calls R (waits) and C | 17 |
-| **R** | Lender Notes | called by A and B, `POST /webhook/review-now`, manual | One LLM call per lender writes the short "good to know" note for each employment type it accepts. Cached by content hash, saved after every batch of 6 | 24 |
-| **C** | Match Notifications | called by B, `POST /webhook/notify-now`, manual | One email per user via Amazon SES, to test aliases only; marks `notified_at` only after SES accepts | 15 |
-| **E** | Failure Alerts | n8n starts it when A, B, R or C fails (their *error workflow* setting) | Mails the failure (workflow, node, error, link to the run) to the owner's verified SES address, so a failed run is never silent | 4 |
+| A | Loan Product Discovery | daily 02:00, manual, `POST /webhook/crawl-now` | Reads three sources, cuts each lender page down to its eligibility text, has an LLM turn that into numeric rules per employment type, upserts `loan_products`, then starts R | 22 |
+| B | User-Loan Matching | `POST /webhook/batch-ready`, called by the parse-csv Lambda | SQL funnel that keeps each user's top 5. No LLM. Then runs R (and waits) and C | 18 |
+| R | Lender Notes | called by A and B, `POST /webhook/review-now`, manual | One LLM call per lender writes the "good to know" note for each employment type. Cached, saved every 6 lenders | 24 |
+| C | Match Notifications | called by B, `POST /webhook/notify-now`, manual | One email per user through SES, to test aliases only | 15 |
+| E | Failure Alerts | n8n's error-workflow hook on A, B, C and R | Emails the owner the workflow, node and error | 4 |
 
 #### The workflows as drawn in n8n
 
 <!-- workflows:start -->
-Each diagram is generated from the workflow's exported JSON by [`scripts/build_workflow_diagrams.py`](scripts/build_workflow_diagrams.py), so it always matches what is in [`n8n/workflows/`](n8n/workflows). Blue rounded = trigger, yellow cylinder = database (SQL), green slanted = external call (LLM, web, SES), double-bordered = another workflow, diamond = decision, plain box = Code node.
+Generated from the exported workflow JSON by [`scripts/build_workflow_diagrams.py`](scripts/build_workflow_diagrams.py), so it matches [`n8n/workflows/`](n8n/workflows). Blue rounded: trigger. Yellow cylinder: SQL. Green slanted: external call (LLM, web, SES). Double border: another workflow. Diamond: decision. Plain box: Code node.
 
 <details>
 <summary><b>Workflow A: Loan Product Discovery (the crawler)</b> (22 nodes, <a href="n8n/workflows/A_loan_product_discovery.json">A_loan_product_discovery.json</a>)</summary>
 
-Three triggers, three lender sources. The rate table is parsed without an LLM; each lender's page is cut down to its eligibility facts; Groq extracts numeric rules, Gemini is the fallback, and invalid answers are dropped.
+Rates come from the list page without an LLM. Each lender page is cut down to its eligibility text, Groq extracts the rules, and Gemini is the fallback.
 
 ```mermaid
 flowchart TD
@@ -177,7 +166,7 @@ flowchart TD
 <details>
 <summary><b>Workflow B: User-Loan Matching (the multi-stage filter)</b> (18 nodes, <a href="n8n/workflows/B_user_loan_matching.json">B_user_loan_matching.json</a>)</summary>
 
-Called by the parse-csv Lambda. Reconciles lenders, then SQL stages shrink 450,000 user-lender pairs to a top 5 per user. No LLM. Then it asks R for notes (and waits) and starts C.
+Called by the parse-csv Lambda. SQL stages cut 450,000 user-lender pairs to a top 5 per user, then R and C run.
 
 ```mermaid
 flowchart TD
@@ -238,7 +227,7 @@ flowchart TD
 <details>
 <summary><b>Workflow R: Lender Notes (the cached LLM reviews)</b> (24 nodes, <a href="n8n/workflows/R_lender_notes.json">R_lender_notes.json</a>)</summary>
 
-One LLM call per lender, only when the lender's text changed (content-hash cache). Groq and Gemini lanes, results saved every 6 lenders.
+One LLM call per lender, only when its page text changed. Groq and Gemini lanes, saved every 6 lenders.
 
 ```mermaid
 flowchart TD
@@ -311,7 +300,7 @@ flowchart TD
 <details>
 <summary><b>Workflow C: Match Notifications (SES)</b> (15 nodes, <a href="n8n/workflows/C_match_notifications.json">C_match_notifications.json</a>)</summary>
 
-One email per user to a test alias, marked as sent only after SES accepts, so failures retry and a second run sends nothing.
+One email per user to a test alias, marked sent only after SES accepts.
 
 ```mermaid
 flowchart TD
@@ -361,7 +350,7 @@ flowchart TD
 <details>
 <summary><b>Workflow E: Failure Alerts (the error workflow)</b> (4 nodes, <a href="n8n/workflows/E_failure_alerts.json">E_failure_alerts.json</a>)</summary>
 
-n8n starts this when A, B, C or R fails, and emails the owner the workflow, node and error.
+Started by n8n when A, B, C or R fails. Emails the owner the workflow, node and error.
 
 ```mermaid
 flowchart LR
@@ -383,75 +372,65 @@ flowchart LR
 </details>
 <!-- workflows:end -->
 
-The workflow JSON in [`n8n/workflows/`](n8n/workflows) is generated by [`scripts/build_workflows.py`](scripts/build_workflows.py)
-from the tested Code-node sources in [`n8n/code/`](n8n/code) and the SQL in [`n8n/sql/`](n8n/sql). I verified that the
-files in the repo are identical (nodes and connections) to what n8n exports from the running instance.
+The JSON in [`n8n/workflows/`](n8n/workflows) is generated by [`scripts/build_workflows.py`](scripts/build_workflows.py) from the tested Code-node sources in [`n8n/code/`](n8n/code) and the SQL in [`n8n/sql/`](n8n/sql). It is identical (nodes and connections) to what n8n exports from the running instance.
 
 ---
 
 ## 2. The Optimization Treasure Hunt
 
-**The problem.** 10,000 users × 45 lender records is 450,000 user-lender pairs. Asking an LLM "does this user
-qualify?" for each pair means 450,000 calls: hours of waiting and a large bill. Even one call per user is 10,000 calls.
-
-**The idea.** Use the LLM only where the input is unstructured text (the lender's web page), once per lender, and
-do all per-user work in SQL on numbers. Candidate pairs never leave Postgres, so n8n's memory is never the bottleneck.
+10,000 users x 45 lender records is 450,000 user-lender pairs. Asking an LLM about each pair would take hours and cost a lot, and even one call per user is 10,000 calls. So the LLM only reads lender web pages (once per lender), and everything per user is SQL on numbers. Candidate pairs never leave Postgres, so n8n's memory is not the limit.
 
 | Stage | What it does | Pairs left | Time |
 |---|---|---:|---:|
-| naive | every user × every lender record | **450,000** | |
-| 0 · reconcile lenders (Code node) | the same bank on several sites collapses to one record (45 → 34 lenders, 11 merged groups) | 340,000 | <1 s |
-| 1 · envelope pre-filter (SQL) | a permissive min/max per lender (a NULL means "no stated limit") drops the clearly ineligible, written to a staging table | 255,951 | ~5 s |
-| 2 · exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI: Salaried needs ₹30,000, Self-Employed has no income floor | 246,591 | ~2 s |
-| 3 · rank, keep top 5 (SQL window function) | flagged-score matches last, then lowest rate, then widest credit-score margin | **50,000** | ~1 s |
-| LLM calls in all of the above | | **0** | |
+| naive | every user x every lender record | 450,000 | |
+| 0. reconcile lenders (Code node) | the same bank on several sites becomes one record (45 to 34 lenders) | 340,000 | <1 s |
+| 1. envelope pre-filter (SQL) | loosest min/max across a lender's rules (NULL means no stated limit), written to a staging table | 255,951 | ~5 s |
+| 2. exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI wants Rs 30,000 from salaried, nothing from self-employed | 246,591 | ~2 s |
+| 3. rank, keep top 5 (window function) | flagged-score matches last, then lowest rate, then widest score margin | 50,000 | ~1 s |
+| LLM calls in all of this | | 0 | |
 
-Whole workflow B on the real 10,000-user batch: **16-19 s** end to end including the network hop to RDS.
+Workflow B takes 16-19 s on the 10,000-user batch, including the network hop to RDS.
 
-**Be honest about where the savings come from.** Most lenders state loose requirements, so the numeric filters only
-remove about 27% of the pairs (340,000 → 246,591). The big wins are (1) keeping the LLM out of the per-user path
-entirely, (2) merging duplicate lenders, and (3) ranking to a top 5 so only 50,000 rows are written and mailed.
+The numeric filters only remove about 27% of the pairs, because most lenders state loose requirements. The real savings are keeping the LLM out of the per-user path, merging duplicate lenders, and ranking to a top 5 so only 50,000 rows are written and mailed.
 
-### What the LLM does, and how that is made cheap
+### Where the LLM is used
 
-The LLM reads lender web text twice, both times per lender and never per user:
+Both uses are per lender, never per user.
 
-1. **Extraction (workflow A):** eligibility text → structured rules (`min_income`, `min_credit_score`, `min_age`, `max_age`, per employment type). Only 2.5 KB of text per lender is sent, not an 800 KB page.
-2. **Notes (workflow R):** a one-sentence "good to know" per employment type, e.g. *"You need at least 1 debit and 2 credit transactions a month in your main account."*
+1. Extraction (workflow A): the eligibility text becomes structured rules (`min_income`, `min_credit_score`, `min_age`, `max_age`, per employment type). About 1-3 KB of text is sent per lender, not an 800 KB page.
+2. Notes (workflow R): one short "good to know" line per employment type.
 
-| Cost control | Effect |
-|---|---|
-| One call per lender, not per employment type | the prompt and lender text are sent once; 87 notes need only 36 calls |
-| Cached by `md5(prompt version + the lender's raw page text)` | unchanged page → **0 calls**; the key deliberately excludes the LLM-written summary, which varies on every crawl even for an identical page |
-| Notes for matched lenders first | after an upload, R reviews only the lender + employment-type pairs in that batch's matches (17 segments for the test batch, 12 already cached), and the emails wait for exactly those |
-| Everything else in the background | A asks R for all lenders after each crawl, so the cache is complete before any outlier user needs it |
-| Saved after every batch of 6 | a restart or a rate limit loses at most one batch |
-| Groq primary, Gemini fallback | two free-tier quotas; a model that runs dry can be swapped in one line |
+What keeps it cheap:
 
-**Users growing never costs more LLM calls.** Notes belong to a lender and an employment type, not a person.
-Only a change in a lender's text triggers a re-review of that lender.
+- One call per lender, not per employment type.
+- Results are cached by `md5(prompt version + the lender's page text)`. An unchanged page costs 0 calls. The LLM's own summary is left out of the key because it changes on every crawl.
+- After an upload, R reviews only the lender and employment-type pairs in that batch's matches, and the emails wait for exactly those. A full pass runs after each crawl.
+- Progress is saved every 6 lenders, so a rate limit loses at most one batch.
+- Groq is the primary and Gemini the fallback, so two free quotas are in play.
+
+More users never means more LLM calls. Only a changed lender page triggers a new review.
 
 ---
 
 ## 3. Repository layout
 
 ```
-infra/                 Terraform: VPC wiring, RDS, S3, Lambdas, API Gateway, n8n EC2, SES, IAM
-  serverless.yml       Serverless Framework definition of the Lambda layer: 3 functions, HTTP API, S3 trigger
-  serverless_vars.js   helper variable file for serverless.yml (splits the subnet list)
+infra/                 Terraform: RDS, S3, Lambdas, API Gateway, n8n EC2, SES, IAM
+  serverless.yml       Serverless Framework definition of the Lambdas, HTTP API and S3 trigger
+  serverless_vars.js   helper for serverless.yml (splits the subnet list)
 lambdas/
-  get_upload_url/      presigned S3 POST (size-capped, content-type pinned, access key required)
-  parse_csv/           streams the CSV, validates, bulk-inserts; notifies n8n
+  get_upload_url/      presigned S3 POST (size-capped, access key required)
+  parse_csv/           streams the CSV, validates, bulk-inserts, calls n8n
   api/                 read side of the web UI: summary, lenders, customer lookup, instant match
-db/migrations/         001-008, idempotent, applied by scripts/migrate.sh
+db/migrations/         001-008, applied by scripts/migrate.sh
 n8n/
   workflows/           A, B, R, C, E (importable JSON)
-  code/                Code-node sources + prompts, with Node unit tests in code/test/
+  code/                Code-node sources and prompts, with Node unit tests in code/test/
   sql/                 every SQL statement the workflows run
   docker-compose.yml   n8n 2.44.4, pinned
-ui/                    the LoanMatch web app (index.html, styles.css, app.js) and its tests in ui/test/
-scripts/               build, deploy, credentials, seeding, status and progress tools
-docs/                  architecture diagram (png, svg, editable .excalidraw, Mermaid), the demo-video checklist and a one-page system explainer
+ui/                    the web app (index.html, styles.css, app.js) and its tests
+scripts/               build, deploy, credentials, seeding, status and audit tools
+docs/                  architecture diagram, demo checklist, one-page explainer
 ```
 
 ---
@@ -459,128 +438,117 @@ docs/                  architecture diagram (png, svg, editable .excalidraw, Mer
 ## 4. Setup and deployment
 
 ### Prerequisites
-- AWS account with CLI credentials for **ap-south-1** (`aws configure`)
-- Terraform ≥ 1.5, Docker (used for `psql`), Python 3.10+, Node 20+ (tests only)
-- A **Groq** API key and a **Gemini** API key
-- A Gmail address (SES sender + `+one` / `+two` test aliases)
+
+- AWS account with CLI credentials for ap-south-1
+- Terraform 1.5 or newer, Docker (used for `psql`), Python 3.10+, Node 20+ (tests only)
+- A Groq API key and a Gemini API key
+- A Gmail address (SES sender, plus `+one` and `+two` test aliases)
 
 ### Steps
 
 ```bash
-# 1. Configure (gitignored file)
+# 1. Configure (the file is gitignored). Edit my_ip_cidr, ses_sender_email, test_recipient_emails.
 cp infra/terraform.tfvars.example infra/terraform.tfvars
-#    edit: my_ip_cidr (curl https://checkip.amazonaws.com), ses_sender_email, test_recipient_emails
 
-# 2. Build the Lambdas and create all AWS infrastructure
+# 2. Build the Lambdas and create the AWS infrastructure. This also writes loan-engine-n8n.pem for SSH.
 ./scripts/build_lambdas.sh
 terraform -chdir=infra init && terraform -chdir=infra apply
-#    -> also writes loan-engine-n8n.pem (gitignored) for SSH to the n8n host
 
-# 3. Click the 3 SES verification links AWS emails to your Gmail (sender + two aliases).
-#    SES in sandbox mode sends only to verified addresses.
+# 3. Click the 3 SES verification links AWS emails you (sender and the two aliases).
+#    SES sandbox only delivers to verified addresses.
 
 # 4. Create the database schema
 ./scripts/migrate.sh
 
 # 5. Open n8n (terraform -chdir=infra output n8n_url) and create the owner account.
-#    n8n v2 has no basic-auth env vars: the first visitor becomes the owner, which is why port
-#    5678 is locked to your IP by the security group.
+#    n8n v2 has no basic-auth variables, so the first visitor becomes the owner.
+#    That is why port 5678 is limited to your IP.
 
-# 6. Load credentials into n8n (see the table below), then deploy the workflows
+# 6. Load the credentials into n8n (table below), then deploy the workflows
 GROQ_API_KEY=... GEMINI_API_KEY=... ./scripts/n8n_credentials.sh
 ./scripts/n8n_ses_credential.sh
 ./scripts/n8n_webhook_credential.sh
 ./scripts/n8n_deploy_workflows.sh
-# every webhook needs this header
 export WEBHOOK_SECRET=$(terraform -chdir=infra output -raw webhook_secret)
 
-# 7. Fetch lender data once, then fill the notes cache
-# ~6 min; ends by starting workflow R
+# 7. Fetch lender data once (10 to 20 min on free-tier LLM quotas); it ends by starting workflow R
 curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/crawl-now
-#    (or POST /webhook/review-now to run only the notes)
 
-# 8. Open the web UI (home, instant "Check offers", lenders, and the console where you upload the CSV)
-# open http://localhost:8000
+# 8. Start the web UI, then open http://localhost:8000
 ./scripts/write_ui_config.sh && python3 -m http.server 8000 --directory ui
 
-# 9. First time only: choose who gets emailed, then notify
-# maps 2 real user_ids to your +one/+two aliases
+# 9. First time only: map two user ids to your +one and +two aliases, then notify
 ./scripts/seed_test_recipients.sh
 curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/notify-now
 ```
 
-After step 9, every upload runs the whole chain by itself: upload → Lambda → B → R → C → email.
+After that, every upload runs the whole chain by itself: upload, parse-csv, B, R, C, email.
 
-### Deploying the Lambda layer with the Serverless Framework (alternative to Terraform's Lambdas)
+### Deploying the Lambdas with the Serverless Framework
 
-Terraform creates the network, database, bucket, IAM roles, SES and the n8n host, and it deploys the Lambdas too. If you would rather deploy the function layer with the Serverless Framework, [infra/serverless.yml](infra/serverless.yml) defines the same three functions (`getUploadUrl`, `parseCsv`, `api`), the HTTP API routes with CORS, and the S3 trigger. It reuses Terraform's least-privilege roles, security group and secrets instead of creating its own:
+Terraform deploys the Lambdas too. To use the Serverless Framework instead, [`infra/serverless.yml`](infra/serverless.yml) defines the same three functions, the HTTP API routes and the S3 trigger, and reuses Terraform's roles, security group and secrets.
 
 ```bash
-# 1. Terraform first (network, RDS, bucket, roles), then build the zips
 ./scripts/build_lambdas.sh
 terraform -chdir=infra apply
-# 2. Read Terraform's outputs into TF_* variables (printed to your shell only, never to a file)
+# read Terraform's outputs into TF_* variables (printed to your shell only)
 eval "$(./scripts/serverless_env.sh)"
-# 3. Deploy; the default stage "sls" names everything loan-engine-sls-...
+# the default stage "sls" names everything loan-engine-sls-...
 cd infra && npx serverless@3 deploy --stage sls
 ```
 
-Notes: a bucket has one notification configuration, so send uploads through either stack's `parseCsv`, not both at once. Serverless v3's schema does not list `python3.12` yet, so `serverless print` shows one `provider.runtime` warning; it is only a warning, and 3.12 is what Terraform runs. This file was validated with `serverless print` (all three functions, six routes, subnet list) but **not deployed**.
+A bucket has one notification configuration, so send uploads through one stack at a time. Serverless v3 does not list `python3.12` in its schema and prints a warning; it is only a warning. This file passes `serverless print` but I have not deployed it.
 
-### Credentials, exactly as configured in n8n
+### Credentials in n8n
 
-`scripts/n8n_credentials.sh` and `scripts/n8n_ses_credential.sh` create these with **fixed ids**, so the workflow JSON
-resolves them automatically. If you create them by hand in the UI instead (Credentials → Create), re-select each
-credential on the nodes that use it.
+`n8n_credentials.sh` and `n8n_ses_credential.sh` create these with fixed ids so the workflow JSON finds them. If you create them by hand (Credentials, Create), re-select each one on the nodes that use it.
 
-| n8n credential (id) | Type | Fields | Where the value comes from |
+| Credential (id) | Type | Fields | Value from |
 |---|---|---|---|
-| **Groq API** (`credGroq000000001`) | Header Auth | Name `Authorization`, Value `Bearer <key>` | your Groq key |
-| **Gemini API** (`credGemini0000001`) | Header Auth | Name `x-goog-api-key`, Value `<key>` | your Gemini key |
-| **Loan DB (RDS)** (`credPostgres00001`) | Postgres | host / port 5432 / database / user / password; **SSL = Require, "Ignore SSL Issues" ON** | `terraform output db_host db_name db_user` and `terraform output -raw db_password` |
-| **Webhook secret** (`credWebhook000001`) | Header Auth | Name `X-Webhook-Secret`, Value `<secret>` | `terraform output -raw webhook_secret` (generated by Terraform; the parse-csv Lambda gets the same value) |
-| **AWS SES (send-only)** (`credAwsSes0000001`) | AWS (IAM) | region `ap-south-1`, access key id, secret | `terraform output ses_access_key_id` and `terraform output -raw ses_secret_access_key` |
+| Groq API (`credGroq000000001`) | Header Auth | `Authorization`: `Bearer <key>` | your Groq key |
+| Gemini API (`credGemini0000001`) | Header Auth | `x-goog-api-key`: `<key>` | your Gemini key |
+| Loan DB (RDS) (`credPostgres00001`) | Postgres | host, port 5432, database, user, password; SSL Require, Ignore SSL Issues on | `terraform output db_host db_name db_user`, `terraform output -raw db_password` |
+| Webhook secret (`credWebhook000001`) | Header Auth | `X-Webhook-Secret`: `<secret>` | `terraform output -raw webhook_secret` |
+| AWS SES (send-only) (`credAwsSes0000001`) | AWS (IAM) | region `ap-south-1`, access key id, secret | `terraform output ses_access_key_id`, `terraform output -raw ses_secret_access_key` |
 
-### Environment variables and where each lives
+### Environment variables
 
 | Variable | Where | Purpose |
 |---|---|---|
-| `my_ip_cidr`, `ses_sender_email`, `test_recipient_emails`, `aws_region`, `db_*`, `*_instance_type` | `infra/terraform.tfvars` (gitignored; example provided) | Terraform inputs |
-| `GROQ_API_KEY`, `GEMINI_API_KEY` | your shell, only when running `n8n_credentials.sh` | stored by n8n as encrypted credentials; never written to a file |
-| `UPLOAD_BUCKET`, `MAX_UPLOAD_BYTES`, `API_KEY` | set on the `get-upload-url` Lambda by Terraform | target bucket, 100 MB cap, and the access key uploads must present |
-| `DB_*`, `API_KEY` | set on the `api` Lambda by Terraform | read-only web API: database access and the access key for private routes |
-| `DB_HOST/PORT/NAME/USER/PASSWORD`, `N8N_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET` | set on the `parse-csv` Lambda by Terraform | database, the private n8n address and the webhook shared secret |
+| `my_ip_cidr`, `ses_sender_email`, `test_recipient_emails`, `aws_region`, `db_*`, `*_instance_type` | `infra/terraform.tfvars` (gitignored, example provided) | Terraform inputs |
+| `GROQ_API_KEY`, `GEMINI_API_KEY` | your shell, only when running `n8n_credentials.sh` | stored by n8n as encrypted credentials, never written to a file |
+| `UPLOAD_BUCKET`, `MAX_UPLOAD_BYTES`, `API_KEY` | `get-upload-url` Lambda, set by Terraform | bucket, 100 MB cap, access key |
+| `DB_*`, `API_KEY` | `api` Lambda, set by Terraform | database access, key for the private routes |
+| `DB_*`, `N8N_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET` | `parse-csv` Lambda, set by Terraform | database, private n8n address, webhook secret |
 | `N8N_ENCRYPTION_KEY`, `N8N_HOST`, `WEBHOOK_URL`, `GENERIC_TIMEZONE` | `/opt/n8n/.env` on the EC2 host, generated by Terraform ([template](n8n/.env.example)) | n8n runtime |
 
-**No secret is committed.** `.env`, `*.tfvars`, `*.pem`, `tfstate`, `ui/config.js` and `data/` are gitignored.
+No secret is committed. `.env`, `*.tfvars`, `*.pem`, `tfstate`, `ui/config.js` and `data/` are gitignored.
 
 ### Operating it
 
 ```bash
-# live list of workflow runs (or the editor's Executions tab)
+# live list of workflow runs
 ./scripts/n8n_status.sh
-# live progress bar of the lender-notes cache
+# progress of the lender-notes cache
 ./scripts/watch_reviews.sh
-# tear everything down when finished (stops the AWS cost)
+# remove everything when finished (stops the AWS cost)
 terraform -chdir=infra destroy
 ```
 
 ### Tests
 
-The same checks run on every push in GitHub Actions (`.github/workflows/ci.yml`): all test suites (including the UI) against a
-Postgres service container, `terraform fmt` and `validate`, and a check that the committed workflow JSON is exactly
-what `build_workflows.py` generates.
+GitHub Actions runs everything on each push: the test suites against a Postgres container, `terraform fmt` and `validate`, and a check that the committed workflow JSON matches what `build_workflows.py` generates.
 
 ```bash
-# 44 tests: normalisers, reconciliation, email, review flow, alerts
+# n8n Code nodes: normalisers, reconciliation, email, review flow, alerts
 node --test n8n/code/test/*.test.js
-# 12 tests (loader tests need a local Postgres, see the file header)
+# parse-csv Lambda (the loader tests need a local Postgres, see the file header)
 cd lambdas/parse_csv && python3 -m unittest -v test_parse_csv
-# 12 tests (no database needed)
+# web API Lambda (no database needed)
 cd lambdas/api && python3 -m unittest -v test_api
-# 12 simulated-browser tests of the web UI against a mock API
+# web UI in a simulated browser against a mock API
 cd ui/test && npm install && ./run.sh
-# independent recompute of every stored top 5 (see section 6)
+# independent recompute of every stored top 5
 ./scripts/audit_matches.py
 ```
 
@@ -588,134 +556,92 @@ cd ui/test && npm install && ./run.sh
 
 ## Web UI and API
 
-A dependency-free web app in [`ui/`](ui) (no build step), styled after clickpe.ai: floating pill navbar, Outfit + Poppins,
-`#295BEE` blue with navy and green accents, 24 px cards and soft gradient blobs. It is a design study, not affiliated with ClickPe.
+A small dependency-free web app in [`ui/`](ui), with no build step, styled after clickpe.ai. It is a design study and is not affiliated with ClickPe.
 
-| Page | What it does | Needs the access key |
+| Page | What it does | Needs the key |
 |---|---|---|
-| **Home** | Hero, feature cards, today's lowest lender rates and a rate comparison, the 4-step process, FAQ | no |
-| **Check offers** | Type income, score, age and employment type; get the top 5 lenders instantly (same ranking as the batch pipeline) | no |
-| **Lenders** | Searchable catalogue: one record per bank, lowest starting rate, accepted types, minimum score | no |
-| **Console → Overview** | Latest batch with a live pipeline stepper, KPIs, and the funnel (450,000 pairs → 50,000) | yes |
-| **Console → Upload** | Drag-and-drop CSV, progress bar, then the pipeline stepper updates as B, R and C run | yes |
-| **Console → Customers** | Find a person by name or id and see their stored offers and email status (the CSV address is never returned; test inboxes are masked) | yes |
+| Home | hero, today's lowest lender rates, how it works, FAQ | no |
+| Check offers | enter income, score, age and employment type, get the top 5 instantly (same ranking as the batch) | no |
+| Lenders | searchable list: one record per bank, lowest rate, accepted types, minimum score | no |
+| Console, Overview | latest batch with a pipeline stepper, KPIs, the funnel | yes |
+| Console, Upload | drag-and-drop CSV, then the stepper follows B, R and C | yes |
+| Console, Customers | find a person and see their stored offers and email status. The CSV address is never returned, and test inboxes are masked | yes |
 
-The browser talks to the same HTTP API as the upload flow. `lambdas/api` adds these routes:
+The `lambdas/api` routes:
 
 | Route | Purpose | Auth |
 |---|---|---|
-| `GET /lenders` | canonical lenders and rates (public web data) | none |
-| `POST /match` | top 5 for one person, via the SQL function `match_user()` | none |
+| `GET /lenders` | lenders and rates (public web data) | none |
+| `POST /match` | top 5 for one profile, via the SQL function `match_user()` | none |
 | `GET /summary` | latest batch, funnel numbers, notes coverage | `x-api-key` |
-| `GET /users?q=` and `GET /users/{id}` | customer lookup and stored offers | `x-api-key` |
-| `POST /upload-url` | presigned upload (starts the pipeline) | `x-api-key` |
+| `GET /users?q=`, `GET /users/{id}` | customer lookup and stored offers | `x-api-key` |
+| `POST /upload-url` | presigned upload, which starts the pipeline | `x-api-key` |
 
-The access key is generated by Terraform (`terraform output -raw api_key`); with no key configured the private routes stay
-closed. `match_user()` is checked against the batch pipeline by `scripts/verify_match_user.sh` (3,000 users: 0 differences).
-Every value shown in the UI is inserted as text, never as HTML, so nothing from the database or lender websites can inject markup.
+Terraform generates the key (`terraform output -raw api_key`); with no key configured the private routes stay closed. `scripts/verify_match_user.sh` compares `match_user()` with the batch pipeline (3,000 users, 0 differences). The UI inserts every value as text, never HTML.
 
 ---
 
 ## 5. Design decisions
 
-**Ingestion**
-- **Presigned-POST upload, then an S3 event.** The browser uploads straight to S3, so API Gateway's 10 MB limit and Lambda's timeout never touch the file. The `batch_id` is embedded in the object key (`uploads/<batch_id>/<file>.csv`), so the first Lambda needs no database and no VPC.
-- **Streamed, chunked load.** `parse-csv` streams the file and inserts 1,000 rows at a time with a single `unnest` statement and `ON CONFLICT DO NOTHING`; the row count is recomputed from the table, so retries are idempotent. The 10,000-row file loads in about 1 s.
-- **`user_id` is the primary key, not email.** The dataset has 10,000 rows but only 2,632 distinct emails, so email would silently drop most users. Notifications are grouped per `user_id`.
-- **Least-privilege networking.** Default VPC with no NAT; an S3 gateway endpoint; separate security groups so RDS accepts only the Lambda, n8n and my IP, and n8n's UI, SSH and webhook accept only my IP and the Lambda.
-- **RDS is publicly addressable, but only from my IP.** `publicly_accessible = true` exists so I can run `psql` and the audit scripts from a laptop without a bastion host. The security group admits only the Lambda, n8n and `my_ip_cidr` (Terraform refuses `0.0.0.0/0`), the volume is encrypted, and connections require TLS. In production I would make it private and reach it through SSM or a bastion.
+Ingestion
 
-**Infrastructure**
-- **Terraform is the deploy path; `serverless.yml` is a full alternative for the function layer.** Terraform owns the VPC, RDS, S3, IAM, SES, EC2 and the Lambdas. The assignment lists Serverless Framework for deployment, so `infra/serverless.yml` defines all three functions, the HTTP API with its routes and CORS, and the S3 trigger, reusing Terraform's IAM roles, security group and secrets (`scripts/serverless_env.sh` reads them from Terraform's outputs). It passes `serverless print` but I never deployed it: both tools would then own the same bucket notification. Use one deploy path per environment.
-- **n8n on a `t3.micro` with docker compose, over plain HTTP.** Good enough for a take-home, with port 5678 locked to my IP and every webhook additionally requiring a shared-secret header (Terraform-generated, held by the Lambda and in an n8n credential), so a stray call from inside the VPC cannot start a run. In production I would put it behind HTTPS (an ALB or Caddy) and a real domain.
-- **DB password as a Lambda environment variable.** Simple and honest for this scope, but the value sits in Terraform state and the function config. Production would use Secrets Manager. State is local and gitignored.
-- **n8n's Postgres credential is TLS-encrypted but not chain-verified.** The n8n credential cannot take a CA bundle; traffic stays inside the VPC. The Lambda does verify the RDS certificate with the bundled CA.
-- **SES sandbox on purpose.** It only delivers to verified addresses, which is exactly the safety property required here.
+- The browser uploads to S3 with a presigned POST and S3 raises an event, so API Gateway's 10 MB limit and Lambda's timeout never touch the file. The batch id is part of the object key (`uploads/<batch_id>/<file>.csv`), so the first Lambda needs no database or VPC.
+- `parse-csv` streams the file and inserts 1,000 rows per `unnest` statement with `ON CONFLICT DO NOTHING`. The row count is recomputed from the table, so a retried S3 event gives the same result. 10,000 rows load in about 1 s.
+- `user_id` is the primary key, not email. The file has 10,000 rows but only 2,632 distinct emails, so keying on email would drop most users.
+- Networking: default VPC with no NAT, an S3 gateway endpoint, and security groups that admit only the Lambda, n8n and my IP.
+- RDS is publicly addressable, but only from my IP (Terraform rejects `0.0.0.0/0`). I did that to run `psql` and the audits from a laptop. The volume is encrypted and TLS is required. In production it would be private, reached through SSM or a bastion.
 
-**Matching**
-- **Rules are per employment type.** Lenders differ by applicant (ICICI: salaried ₹30,000; self-employed none), so a single `min_income` per lender would be wrong. A permissive "envelope" (a NULL in any rule makes that bound NULL) makes Stage 1 a guaranteed superset of Stage 2.
-- **Self-Employed implies Business.** Indian lenders use "self-employed" for professionals and non-professionals alike, while the CSV splits them into two categories, so a lender that accepts one accepts the other.
-- **One record per lender, with an authority order.** The same bank appears on several sites with different thresholds. Eligibility rules come from the lender's own site first, then the record stating more criteria, then Paisabazaar before BankBazaar.
-- **The rate is the lowest published across sources**, shown as "From X%". Aggregators disagree (Axis: 9.99% vs 8.75%) and a customer cares about the best published rate. The rate and the rules can therefore come from different sources.
-- **Unstated is not "no limit".** When a lender states a minimum score for one applicant type and nothing for another, a user below that minimum is **flagged** ("Check: your score is 670; 700 is required for other applicants"), ranked behind unflagged matches, and the email shows the score against the minimum. After the extraction audit below, the live lender data happens to contain no such mismatch (flagged matches: 0 of 50,000), so this path is covered by unit tests and `match_user()` checks rather than by live rows.
-- **Top 5, ranked.** Unflagged first, then lowest rate, then the widest credit-score margin. A user receives a short, useful list instead of 34 lenders.
-- **The LLM annotates, it never removes.** A first version let the LLM veto segments; on real data it applied a salaried income floor to self-employed applicants and flipped between runs. So it may only mark a segment `eligible` or `conditional` with a caveat. An "ineligible" answer is demoted. Eligibility is decided only by exact SQL.
+Infrastructure
 
-**Notifications**
-- **Hard safety rail.** The notification query takes the recipient from `test_recipients` only and never selects `users.email`; users without a mapping are skipped. Real CSV addresses cannot be mailed.
-- **Idempotent.** `notified_at` is set only for emails SES accepted, so a failed send is retried and a second run sends nothing.
-- **Escaping.** Names and notes from the CSV or the web are HTML-escaped, and a newline in a name cannot inject a mail header.
+- Terraform is the deploy path that I ran. `serverless.yml` covers the Lambda layer for the Serverless Framework and reuses Terraform's roles and secrets. Use one path per environment.
+- n8n runs on a `t3.micro` with Docker Compose over plain HTTP, with port 5678 limited to my IP. Every webhook also needs a shared-secret header, so a stray call from inside the VPC cannot start a run. Production would put it behind HTTPS (ALB or Caddy) on a real domain.
+- The database password is a Lambda environment variable, so it sits in Terraform state and the function config. Production would use Secrets Manager and remote state.
+- n8n's Postgres credential uses TLS without verifying the certificate chain, because the credential cannot take a CA bundle. The Lambdas do verify it.
+- SES stays in sandbox on purpose: it only delivers to verified addresses, which is the safety property this assignment needs.
 
----
+Matching
 
-## Scaling the ingestion (design notes, not built)
+- Rules are per employment type, because lenders differ by applicant (ICICI: salaried Rs 30,000, self-employed none). The Stage 1 envelope is the loosest bound over those rules, so it can never drop someone Stage 2 would accept.
+- Self-Employed implies Business. Indian lenders use "self-employed" for both, while the CSV splits them.
+- Each bank becomes one record. Rules come from the lender's own site first, then the page with more criteria, then Paisabazaar, then BankBazaar. The rate is the lowest published across sources and shown as "From X%", since aggregators disagree (Axis: 9.99% vs 8.75%).
+- If a lender states a minimum score for one applicant type and nothing for another, a user below that minimum is flagged ("your score is 670; 700 is required for other applicants"), ranked last, and the email shows it. The current lender data has no such case (0 flagged of 50,000), so this is covered by unit tests rather than live rows.
+- The LLM only annotates. An early version let it veto lenders and it applied a salaried income floor to self-employed users and changed its answer between runs. Now it can mark a lender `eligible` or `conditional` with a note, and exact SQL decides eligibility.
 
-What is already in place: the browser uploads **straight to S3** (no API Gateway or Lambda size limit), the Lambda
-**streams** the file and inserts **1,000 rows per statement**, and matching is set-based SQL. A 10,000-row file loads
-in about 1 s; a few million rows fit inside the Lambda's 300 s limit.
+Notifications
 
-For files in the tens of millions of rows (or several large uploads at once) I would add, in this order:
+- The recipient comes from `test_recipients` only. The query never selects `users.email`, and users with no mapping are skipped, so CSV addresses cannot be mailed.
+- `notified_at` is set only for emails SES accepted. A failed send is retried and a second run sends nothing.
+- Names and notes are HTML-escaped, and a newline in a name cannot inject a mail header.
 
-1. **S3 → SQS → Lambda.** Replace the direct S3 trigger with a queue so bursts are buffered and a failed file is retried
-   or dead-lettered instead of lost; set the Lambda's reserved concurrency so it cannot overwhelm the database.
-2. **Split large files.** A small "splitter" step writes byte ranges (S3 `Range` GETs) as separate messages, so many Lambdas
-   load one file in parallel; `ON CONFLICT DO NOTHING` already makes overlapping retries safe.
-3. **Protect the database.** Put RDS Proxy in front of it (Lambda connection storms) and move to a larger instance or
-   Aurora Serverless v2; load into the staging table with `COPY` for the biggest batches.
-4. **Make B incremental.** Matching a batch is already independent of other batches; for very large batches run Stage 1
-   in user-id ranges so each statement stays short and the work can be spread over several n8n executions.
+Scaling the ingestion (not built)
 
-The LLM cost does not grow with users at all (see section 2), so nothing in this list involves the LLM.
+Uploads already go straight to S3, the Lambda streams the file, and matching is set-based SQL. A few million rows fit in the Lambda's 300 s limit. Beyond that I would add S3 to SQS to Lambda (buffering, retries, a dead-letter queue), split large files by byte range so several Lambdas load one file, put RDS Proxy in front of the database, and run Stage 1 in user-id ranges. None of this touches the LLM, whose cost does not grow with users.
 
 ---
 
 ## 6. Accuracy and known limitations
 
-### How the output was validated
+### How the output was checked
 
-I checked the emails against the raw CSV and the live lender websites by hand, not against my own database:
+- I compared the two emails with the raw CSV and the live lender pages by hand. The customers' rows are identical in `data/users.csv` and RDS, every rate in the emails equals the lowest published rate on the Paisabazaar and BankBazaar rate cards, and each emailed lender's eligibility text was read against the customer.
+- `scripts/audit_matches.py` recomputes all 10,000 top-5 lists in plain Python: 0 differences, and no match goes to a lender that does not accept the user's employment type.
+- `scripts/verify_match_user.sh` checks the instant "Check offers" function against the stored matches: 0 differences over 3,000 users.
 
-1. **CSV → database → email.** The two emailed customers' rows are byte-identical in `data/users.csv` and RDS (all 10,000 rows load, 2,632 distinct emails).
-2. **Rates.** The lowest published rate per lender, re-read from the live Paisabazaar and BankBazaar rate cards, equals every rate in the emails (for example Axis 8.75%, Bandhan 8.86%, Union Bank 8.90%).
-3. **Eligibility.** For each emailed lender, and for the cheaper lenders that were skipped, I read the live eligibility text and checked it against the customer: ICICI's self-employed age band, IDFC FIRST's 760 score for self-employed applicants (so it is correctly absent for a 670 score), Indian Bank's 700 score floor, Bajaj's own page saying "CIBIL 650 or higher" (the aggregator's 685 is out of date), SBI and Kotak being salaried products.
-4. **Independent recompute.** `scripts/audit_matches.py` re-derives all 10,000 top-5 lists in plain Python: 0 differences.
+### Two bugs the manual checks found
 
-**What this found, and the fix.** The manual read exposed a real bug: the extraction prompt treated "doctors" as self-employed and
-defaulted to "all three types" when a page named none, so salaried-only products (Axis, Canara) were matched to 6,611 and 2,302
-self-employed or business customers. The prompt now grants those types only when the page says the general loan is open to them,
-and a deterministic check drops them when the page never mentions self-employed applicants. After a re-crawl, Axis is matched to 0
-non-salaried customers, and no match goes to a lender that does not accept the customer's employment type.
+1. The extraction prompt counted "doctors" as self-employed and defaulted to all three employment types when a page named none. Salaried-only lenders (Axis, Canara) were matched to thousands of self-employed users. The prompt now grants those types only when the page says the general loan is open to them, and a check in code drops them when the page never mentions self-employed applicants.
+2. I then read all 45 lender records against the live page and the text the LLM was actually given. The context builder was the weak point. It only read sections under an "eligibility" heading, so IndusInd, Canara, HDFC and IIFL facts (under "For salaried employees", a scheme name, or an unlabelled card) never reached the LLM. Rate tables filled the context with noise. Advice like "700+ gives higher chances" came back as a minimum score for Yes Bank, DMI Finance and PNB.
 
-### Lender-by-lender audit of what the LLM is given
+The fix: skip rate tables, cap each section, sweep the whole page for sentences stating an eligibility fact (dropping text repeated across five or more pages), tell the model that advice is not a requirement, and drop any score that no non-advisory sentence supports. All have unit tests. After a re-crawl the median context grew from 743 to about 1,160 characters and the rules of 15 of 45 records changed. I checked each change against its page. Matching was then re-run on a fresh upload and both audits still show 0 differences.
 
-A second manual pass compared, for **all 45 lender records** (Paisabazaar, BankBazaar, Bajaj Finserv), the live page text, the text the LLM was actually given, and the rules it returned. It found that the context builder, not the model, was the weak point:
+### Limitations
 
-- It kept only the first two sections under an "eligibility"-style heading, so facts under other headings were never seen: IndusInd (BankBazaar) lists age and income under "For salaried employees", Canara under a scheme name ("Canara Ready Cash"), and HDFC and IIFL in an unlabelled "Eligibility Criteria" card. Those lenders reached the LLM with 67-700 characters of context and came back with no usable rules.
-- Rate tables ("Credit Score-Based Risk Grade | Interest Rates") passed its key-facts filter and filled the context with noise.
-- Advice such as "a score of 700 or above gives higher chances" was sometimes returned as a minimum credit score (Yes Bank, DMI Finance, PNB), which would wrongly flag or reject users.
-
-Fixes: the context builder now (a) skips rate and fee tables, (b) caps each heading section so one long section cannot crowd out the rest, and (c) sweeps the whole page for sentences stating an eligibility fact, dropping sentences that repeat across five or more pages (site boilerplate), amounts, tenures and rates. The prompt states that soft guidance and "most lenders" statements are not requirements, and a deterministic guard drops any credit-score floor that is not backed by a non-advisory sentence in the context. Each has a unit test (`n8n/code/test/`).
-
-Result after a full re-crawl: the median context grew from 743 to about 1,160 characters (none hit the 3,500 cap), the rules of 15 of the 45 records changed, and every change was checked against the page. IndusInd now has income ≥ 25,000 and age 21-65, Canara income ≥ 50,000 and age 21-55, HDFC gained its self-employed rule (income ≥ 20,000, age 21-65), and the three advisory scores above were removed. IDFC FIRST's 710 (salaried) and 760 (self-employed) are kept because the page states them as requirements. Matching was then re-run on a fresh upload: 10,000 users, 50,000 matches, 0 differences in both independent audits (`audit_matches.py` and `verify_match_user.sh`).
-
-Known gaps found by the audit and not fixed:
-
-- Moneyview and Paysense publish no detail link, so only their table rows are available, and one Bajaj Finserv entry duplicates another.
-- The LLM is not fully deterministic between crawls: for Indian Bank (a profession-based overdraft scheme) one crawl returned salaried only and another all three types, because the page mentions licensed professionals. Both readings are defensible; the guards cannot arbitrate between them.
-- Paisabazaar's income figures for some banks are its own estimates ("applicants with Rs 15,000 would be able to avail"), not the lender's stated minimum.
-
-Remaining differences I did not "fix": lender detail pages sometimes quote a slightly lower starting rate than the comparison table
-on the same site (Bandhan 8.82% vs 8.86%, Punjab & Sind 9.60% vs 9.90%, Canara 9.70% vs 9.95%); we use the rate-card numbers.
-
-The matching logic is exact and verified: I re-derived every user's top 5 independently for all 10,000 users and found 0 differences. The data behind it is **public web text read by an LLM**, so the output is **indicative, not a guaranteed offer**.
-
-- Extraction can miss a number, and a missing number becomes "no limit" (the score flag covers one important case, not all).
-- Rates are headline "from" rates, not personalised offers; the lender decides.
-- Most lenders publish no minimum credit score; the email says so ("Lender does not publish a minimum").
-- The "good to know" notes are LLM-written. Spot checks found them faithful, but one framed a list of eligible groups as a condition.
-- Free-tier LLM quotas are small and per model (Gemini ≈ 20 requests/day per model; Groq has per-minute and daily token caps). A throttled review simply retries on the next run, and no match depends on it.
-- The crawler reads three public sources; Policybazaar redirects to Paisabazaar, so Bajaj Finserv's own site is the third.
-- Not exercised live on AWS: the `webhook_failed` path (a failed n8n call from the Lambda) and a deployment of `serverless.yml` (it is validated with `serverless print` only).
-
----
-
+- The data is public web text read by an LLM, so results are indicative, not a guaranteed offer. A missing number becomes "no limit"; the score flag covers one important case, not all.
+- The LLM can read an ambiguous page two ways on different days (Indian Bank's professional overdraft scheme came back salaried-only once and all types once).
+- Some aggregator income figures are the aggregator's own estimate, not the lender's stated minimum. Detail pages sometimes quote a slightly lower rate than the comparison table (Bandhan 8.82% vs 8.86%); I use the rate-card numbers.
+- Moneyview and Paysense have no detail page, so only their table rows are available.
+- Most lenders publish no minimum credit score; the email says "Lender does not publish a minimum".
+- The notes are LLM-written. Spot checks found them faithful, but one framed a list of eligible groups as a condition.
+- Free-tier quotas are small (Gemini about 20 requests a day per model, Groq has per-minute and daily token caps). A throttled review retries on the next run and no match depends on it.
+- The crawler reads Paisabazaar, BankBazaar and Bajaj Finserv's own site. Policybazaar redirects to Paisabazaar.
+- Not run live: the `webhook_failed` path and a deployment of `serverless.yml`.
