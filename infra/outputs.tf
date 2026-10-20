@@ -44,3 +44,17 @@ output "n8n_webhook_url_for_lambda" {
 output "n8n_ssh" {
   value = "ssh -i ${var.project_name}-n8n.pem ec2-user@${aws_eip.n8n.public_ip}"
 }
+
+output "ses_sender_email" {
+  value = var.ses_sender_email
+}
+
+output "ses_access_key_id" {
+  description = "Access key of the send-only SES IAM user (load into n8n with scripts/n8n_ses_credential.sh)."
+  value       = aws_iam_access_key.n8n_ses.id
+}
+
+output "ses_secret_access_key" {
+  value     = aws_iam_access_key.n8n_ses.secret
+  sensitive = true
+}

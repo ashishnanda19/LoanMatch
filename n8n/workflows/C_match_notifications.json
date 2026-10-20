@@ -1,0 +1,446 @@
+{
+  "id": "workflowC0000001",
+  "name": "C - Match Notifications (SES)",
+  "nodes": [
+    {
+      "id": "01902e76-7aec-5161-b64e-54221e26c961",
+      "name": "Executed by Workflow B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "position": [
+        0,
+        160
+      ]
+    },
+    {
+      "id": "1ca7ef6b-9b92-5a41-acfb-1895e0f6a425",
+      "name": "Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        0,
+        360
+      ]
+    },
+    {
+      "id": "f4d1a44e-4b87-5e0f-9a27-3f666fe13a8b",
+      "name": "Notify now (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-now",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "position": [
+        0,
+        560
+      ],
+      "webhookId": "notify-now-webhook"
+    },
+    {
+      "id": "6dcff73b-38d6-5897-83da-14d9a3162c02",
+      "name": "Read batch id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Read batch id\"\n// Workflow C has three entry points: called by Workflow B ({batch_id}), the notify-now webhook\n// ({body:{batch_id}}) or a manual run (no input). An empty batch id means \"all pending matches\".\nconst j = ($input.first() && $input.first().json) || {};\nconst id = j.batch_id || (j.body && j.body.batch_id) || '';\nreturn [{ json: { batch_id: /^[0-9a-f-]{36}$/i.test(id) ? id : '' } }];\n"
+      },
+      "position": [
+        240,
+        360
+      ]
+    },
+    {
+      "id": "576ad56a-aab5-516f-a002-eecd6aa5f17d",
+      "name": "Load pending notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT u.user_id,\n       u.name,\n       tr.recipient_email,\n       (SELECT value FROM app_settings WHERE key = 'ses_sender_email') AS sender_email,\n       jsonb_agg(jsonb_build_object(\n           'match_id', m.match_id,\n           'rank',     m.match_rank,\n           'product',  p.product_name,\n           'rate',     p.interest_rate,\n           'verdict',  r.verdict,\n           'caveat',   r.caveat\n       ) ORDER BY m.match_rank, m.match_id) AS products\nFROM matches m\nJOIN users u            ON u.user_id = m.user_id\nJOIN test_recipients tr ON tr.user_id = m.user_id\nJOIN loan_products p    ON p.product_id = m.product_id\nLEFT JOIN qualitative_reviews r\n       ON r.product_id = m.product_id\n      AND r.employment_type = u.employment_status\n      AND r.criteria_hash = md5('rv4|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, ''))\nWHERE m.notified_at IS NULL\n  AND ($1 = '' OR u.batch_id = $1::uuid)\nGROUP BY u.user_id, u.name, tr.recipient_email\nORDER BY u.user_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.batch_id ] }}"
+        }
+      },
+      "position": [
+        480,
+        360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "1a1c4c75-ad6a-5176-beae-3484a3af3908",
+      "name": "Anyone to email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "eaa058d9-37f1-54fb-9c64-0069245e0fdc",
+              "leftValue": "={{ $json.user_id !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        720,
+        360
+      ]
+    },
+    {
+      "id": "62567a9b-58fd-599e-854c-e0b9c6326e8c",
+      "name": "Nothing to send",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        960,
+        520
+      ]
+    },
+    {
+      "id": "03228703-7b47-5d4c-98f7-ddba5859cc83",
+      "name": "Build email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Build email\"  (one item in per user, one email out per user)\n// Input : a row from pending_notifications.sql {user_id, name, recipient_email, sender_email, products[]}\n// Output: {user_id, to, from, subject, html, match_ids}\n// Everything that came from the CSV or a crawled page is HTML-escaped, and the subject is forced\n// onto a single line (a name containing a newline must not be able to inject mail headers).\nconst esc = (s) => String(s == null ? '' : s)\n  .replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst oneLine = (s) => String(s == null ? '' : s).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').replace(/\\s+/g, ' ').trim();\nconst rate = (r) => (r === null || r === undefined || r === '' || isNaN(Number(r)) ? 'Rate on request' : `${Number(r).toFixed(2)}% p.a.`);\n\nreturn $input.all().map(({ json: u }) => {\n  const products = Array.isArray(u.products) ? u.products : [];\n  const first = oneLine(u.name).split(' ')[0] || 'there';\n  const n = products.length;\n  const rows = products.map((p, i) => {\n    const note = p.caveat\n      ? `<span style=\"color:#8a5a00\">Check: ${esc(p.caveat)}</span>`\n      : (p.verdict === 'eligible' ? 'No extra conditions found' : 'Final approval by the lender');\n    return `<tr>` +\n      `<td style=\"padding:10px;border-bottom:1px solid #e5e7eb;font-weight:600\">${i + 1}</td>` +\n      `<td style=\"padding:10px;border-bottom:1px solid #e5e7eb\">${esc(oneLine(p.product))}</td>` +\n      `<td style=\"padding:10px;border-bottom:1px solid #e5e7eb;white-space:nowrap\">${esc(rate(p.rate))}</td>` +\n      `<td style=\"padding:10px;border-bottom:1px solid #e5e7eb;font-size:13px\">${note}</td></tr>`;\n  }).join('');\n  const html =\n    `<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:auto;color:#111827\">` +\n    `<h2 style=\"margin-bottom:4px\">Hi ${esc(first)}, here are your best personal loan matches</h2>` +\n    `<p style=\"margin-top:0;color:#4b5563\">We compared your income, credit score, age and employment type with ` +\n    `current lender criteria. These ${n} lender${n === 1 ? '' : 's'} fit you best, lowest interest rate first.</p>` +\n    `<table style=\"width:100%;border-collapse:collapse;font-size:14px\">` +\n    `<tr style=\"background:#f3f4f6;text-align:left\"><th style=\"padding:10px\">#</th><th style=\"padding:10px\">Lender</th>` +\n    `<th style=\"padding:10px\">Interest rate</th><th style=\"padding:10px\">Good to know</th></tr>${rows}</table>` +\n    `<p style=\"font-size:12px;color:#6b7280;margin-top:20px\">Rates are indicative, taken from lender websites, ` +\n    `and the final decision rests with each lender.</p></div>`;\n  return {\n    json: {\n      user_id: u.user_id,\n      to: u.recipient_email,\n      from: u.sender_email,\n      subject: `${first}, your ${n} best personal loan match${n === 1 ? '' : 'es'}`.slice(0, 200),\n      html,\n      match_ids: products.map((p) => p.match_id),\n    },\n  };\n});\n"
+      },
+      "position": [
+        960,
+        280
+      ]
+    },
+    {
+      "id": "cd0bb8ff-1546-5e79-a080-740f826455cc",
+      "name": "Send via SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}",
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "isBodyHtml": true,
+        "additionalFields": {}
+      },
+      "position": [
+        1200,
+        280
+      ],
+      "credentials": {
+        "aws": {
+          "id": "credAwsSes0000001",
+          "name": "AWS SES (send-only)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "874d3d05-1c8c-53e7-8a74-bd284065a9b4",
+      "name": "Record send outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Record send outcome\"  (runs once, right after the SES node)\n// Pairs every SES result with the email it belongs to and flags success. With\n// onError=continueRegularOutput a failed send arrives as an item with an `error` field, so a\n// failure never stops the other users' emails and never marks anything as notified.\nreturn $input.all().map((item, i) => {\n  const mail = $('Build email').itemMatching(i).json;\n  const failed = !!(item.json && item.json.error) || !(item.json && item.json.MessageId);\n  return {\n    json: {\n      user_id: mail.user_id,\n      to: mail.to,\n      match_ids: mail.match_ids,\n      match_ids_json: JSON.stringify(mail.match_ids),\n      sent: !failed,\n      message_id: failed ? null : item.json.MessageId,\n      error: failed ? JSON.stringify((item.json && item.json.error) || item.json).slice(0, 300) : null,\n    },\n  };\n});\n"
+      },
+      "position": [
+        1440,
+        280
+      ]
+    },
+    {
+      "id": "b443368d-9f62-585b-82b8-4d98f6dc9740",
+      "name": "Email accepted by SES?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "64320a75-fa7c-50ef-91f4-347d6e058cdc",
+              "leftValue": "={{ $json.sent === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        1680,
+        280
+      ]
+    },
+    {
+      "id": "4dc83899-d8f3-5402-825e-5a7ed3412e80",
+      "name": "Mark matches notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE matches SET notified_at = now()\nWHERE match_id IN (SELECT jsonb_array_elements_text($1::jsonb)::bigint)\n  AND notified_at IS NULL\nRETURNING match_id, user_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.match_ids_json ] }}"
+        }
+      },
+      "position": [
+        1920,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      }
+    },
+    {
+      "id": "6349ec09-b4d2-5301-97d6-e0c030f0408d",
+      "name": "Left un-notified (will retry)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        1920,
+        400
+      ]
+    },
+    {
+      "id": "43f42d20-f33a-51da-a735-701260f61641",
+      "name": "Merge outcomes",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "parameters": {
+        "mode": "append"
+      },
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "id": "6426858c-e76e-5a6e-a98b-fdaf328bb325",
+      "name": "Notification summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Notification summary\"\nconst outcomes = $('Record send outcome').all().map((i) => i.json);\nconst sent = outcomes.filter((o) => o.sent);\nreturn [{\n  json: {\n    emails_sent: sent.length,\n    emails_failed: outcomes.length - sent.length,\n    matches_marked_notified: sent.reduce((n, o) => n + o.match_ids.length, 0),\n    recipients: sent.map((o) => o.to),\n    failures: outcomes.filter((o) => !o.sent).map((o) => ({ user_id: o.user_id, error: o.error })),\n    finished_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "position": [
+        2400,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Executed by Workflow B": {
+      "main": [
+        [
+          {
+            "node": "Read batch id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Read batch id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify now (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Read batch id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read batch id": {
+      "main": [
+        [
+          {
+            "node": "Load pending notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load pending notifications": {
+      "main": [
+        [
+          {
+            "node": "Anyone to email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anyone to email?": {
+      "main": [
+        [
+          {
+            "node": "Build email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email": {
+      "main": [
+        [
+          {
+            "node": "Send via SES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via SES": {
+      "main": [
+        [
+          {
+            "node": "Record send outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record send outcome": {
+      "main": [
+        [
+          {
+            "node": "Email accepted by SES?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email accepted by SES?": {
+      "main": [
+        [
+          {
+            "node": "Mark matches notified",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Left un-notified (will retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark matches notified": {
+      "main": [
+        [
+          {
+            "node": "Merge outcomes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Left un-notified (will retry)": {
+      "main": [
+        [
+          {
+            "node": "Merge outcomes",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge outcomes": {
+      "main": [
+        [
+          {
+            "node": "Notification summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 3600
+  },
+  "pinData": {}
+}

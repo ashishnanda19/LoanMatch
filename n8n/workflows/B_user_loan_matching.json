@@ -260,13 +260,38 @@
       "alwaysOutputData": true
     },
     {
-      "id": "9826904c-5729-5a5d-bdb7-42c410adbd03",
-      "name": "Hand off to Workflow C (Phase 4)",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "parameters": {},
+      "id": "8c5e4622-974c-50ad-8017-13a0c618010d",
+      "name": "Prepare hand-off",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Prepare hand-off\"\n// Tells Workflow C which batch just finished, so it emails only that batch's pending matches.\nreturn [{ json: { batch_id: $('Validate payload').first().json.batch_id } }];\n"
+      },
       "position": [
         3120,
+        300
+      ]
+    },
+    {
+      "id": "591180b0-f925-55e6-84e0-58e047370a94",
+      "name": "Start Workflow C (notifications)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "workflowC0000001",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "position": [
+        3360,
         300
       ]
     }
@@ -408,7 +433,18 @@
       "main": [
         [
           {
-            "node": "Hand off to Workflow C (Phase 4)",
+            "node": "Prepare hand-off",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare hand-off": {
+      "main": [
+        [
+          {
+            "node": "Start Workflow C (notifications)",
             "type": "main",
             "index": 0
           }

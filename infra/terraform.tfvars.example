@@ -1,3 +1,7 @@
 # Copy to terraform.tfvars (gitignored) and fill in.
 aws_region = "ap-south-1"
 my_ip_cidr = "203.0.113.4/32" # your public IP: curl https://checkip.amazonaws.com
+
+# Phase 4 - email. SES sandbox sends only to verified addresses; the aliases all land in your inbox.
+ses_sender_email      = "you@gmail.com"
+test_recipient_emails = ["you+one@gmail.com", "you+two@gmail.com"]

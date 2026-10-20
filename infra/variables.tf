@@ -37,3 +37,18 @@ variable "db_username" {
   type    = string
   default = "loanadmin"
 }
+
+variable "ses_sender_email" {
+  description = "Verified SES sender (From) address for match notifications."
+  type        = string
+}
+
+variable "test_recipient_emails" {
+  description = "Test inboxes (e.g. you+one@gmail.com). SES sandbox only delivers to verified addresses, and the workflow only ever mails these - never the addresses in the uploaded CSV."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.test_recipient_emails) > 0
+    error_message = "Provide at least one test recipient address."
+  }
+}

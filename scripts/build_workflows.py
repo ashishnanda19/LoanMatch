@@ -18,6 +18,7 @@ OUT = ROOT / "n8n" / "workflows"
 
 CRED_GROQ = {"httpHeaderAuth": {"id": "credGroq000000001", "name": "Groq API"}}
 CRED_GEMINI = {"httpHeaderAuth": {"id": "credGemini0000001", "name": "Gemini API"}}
+CRED_AWS = {"aws": {"id": "credAwsSes0000001", "name": "AWS SES (send-only)"}}
 CRED_PG = {"postgres": {"id": "credPostgres00001", "name": "Loan DB (RDS)"}}
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -304,7 +305,10 @@ def build_workflow_b():
     code_node(f, "Funnel report", "funnel_report.js", (2400, 300), __TOP_N__=str(TOP_N))
     pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (2640, 300))
     pg(f, "Clean up candidates", "cleanup_candidates.sql", "[ " + BATCH + " ]", (2880, 300), always_output=True)
-    f.add("Hand off to Workflow C (Phase 4)", "n8n-nodes-base.noOp", 1, {}, (3120, 300))
+    code_node(f, "Prepare hand-off", "prepare_handoff.js", (3120, 300))
+    f.add("Start Workflow C (notifications)", "n8n-nodes-base.executeWorkflow", 1.2,
+          {"source": "database", "workflowId": {"__rl": True, "value": "workflowC0000001", "mode": "id"},
+           "mode": "once", "options": {"waitForSubWorkflow": False}}, (3360, 300))
 
     for a, b in [("Batch ready (webhook)", "Validate payload"), ("Validate payload", "Mark batch matching"),
                  ("Mark batch matching", "Load fresh products"), ("Load fresh products", "Stage 0: reconcile lenders"),
@@ -313,9 +317,56 @@ def build_workflow_b():
                  ("Stage 1: SQL envelope pre-filter", "Stage 2: exact per-type rules"),
                  ("Stage 2: exact per-type rules", "Stage 3: rank and keep top lenders"),
                  ("Stage 3: rank and keep top lenders", "Funnel report"), ("Funnel report", "Finish batch"),
-                 ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Hand off to Workflow C (Phase 4)")]:
+                 ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Prepare hand-off"),
+                 ("Prepare hand-off", "Start Workflow C (notifications)")]:
         f.link(a, b)
     f.dump("B_user_loan_matching.json")
+
+
+# ----------------------------------------------------------------------------- Workflow C
+def build_workflow_c():
+    f = Flow("workflowC0000001", "C - Match Notifications (SES)")
+    f.add("Executed by Workflow B", "n8n-nodes-base.executeWorkflowTrigger", 1.1,
+          {"inputSource": "passthrough"}, (0, 160))
+    f.add("Manual trigger", "n8n-nodes-base.manualTrigger", 1, {}, (0, 360))
+    # On-demand: curl -X POST http://<n8n>:5678/webhook/notify-now  [-d '{"batch_id": "..."}']
+    f.add("Notify now (webhook)", "n8n-nodes-base.webhook", 2,
+          {"httpMethod": "POST", "path": "notify-now", "responseMode": "onReceived", "options": {}},
+          (0, 560), webhookId="notify-now-webhook")
+    code_node(f, "Read batch id", "normalize_trigger.js", (240, 360))
+    pg(f, "Load pending notifications", "pending_notifications.sql", "[ $json.batch_id ]", (480, 360),
+       always_output=True)
+    if_node(f, "Anyone to email?", "={{ $json.user_id !== undefined }}", (720, 360))
+    f.add("Nothing to send", "n8n-nodes-base.noOp", 1, {}, (960, 520))
+    code_node(f, "Build email", "build_email.js", (960, 280))
+    f.add("Send via SES", "n8n-nodes-base.awsSes", 1, {
+        "resource": "email", "operation": "send", "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}", "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}", "isBodyHtml": True, "additionalFields": {}},
+        (1200, 280), credentials=CRED_AWS, onError="continueRegularOutput", retryOnFail=True,
+        maxTries=2, waitBetweenTries=2000)
+    code_node(f, "Record send outcome", "record_outcome.js", (1440, 280))
+    if_node(f, "Email accepted by SES?", "={{ $json.sent === true }}", (1680, 280))
+    pg(f, "Mark matches notified", "mark_notified.sql", "[ $json.match_ids_json ]", (1920, 200))
+    f.add("Left un-notified (will retry)", "n8n-nodes-base.noOp", 1, {}, (1920, 400))
+    f.add("Merge outcomes", "n8n-nodes-base.merge", 3, {"mode": "append"}, (2160, 300))
+    code_node(f, "Notification summary", "notify_summary.js", (2400, 300))
+
+    for t in ("Executed by Workflow B", "Manual trigger", "Notify now (webhook)"):
+        f.link(t, "Read batch id")
+    for a, b in [("Read batch id", "Load pending notifications"), ("Load pending notifications", "Anyone to email?")]:
+        f.link(a, b)
+    f.link("Anyone to email?", "Build email", 0)
+    f.link("Anyone to email?", "Nothing to send", 1)
+    for a, b in [("Build email", "Send via SES"), ("Send via SES", "Record send outcome"),
+                 ("Record send outcome", "Email accepted by SES?")]:
+        f.link(a, b)
+    f.link("Email accepted by SES?", "Mark matches notified", 0)
+    f.link("Email accepted by SES?", "Left un-notified (will retry)", 1)
+    f.link("Mark matches notified", "Merge outcomes", 0, target_input=0)
+    f.link("Left un-notified (will retry)", "Merge outcomes", 0, target_input=1)
+    f.link("Merge outcomes", "Notification summary")
+    f.dump("C_match_notifications.json")
 
 
 if __name__ == "__main__":
@@ -326,3 +377,4 @@ if __name__ == "__main__":
     else:
         build_workflow_a()
         build_workflow_b()
+        build_workflow_c()
