@@ -150,6 +150,7 @@ resource "aws_lambda_function" "get_upload_url" {
     variables = {
       UPLOAD_BUCKET    = aws_s3_bucket.uploads.bucket
       MAX_UPLOAD_BYTES = tostring(100 * 1024 * 1024)
+      API_KEY          = random_password.api_key.result
     }
   }
 
@@ -221,8 +222,8 @@ resource "aws_apigatewayv2_api" "main" {
 
   cors_configuration {
     allow_origins = ["*"]
-    allow_methods = ["POST", "OPTIONS"]
-    allow_headers = ["content-type"]
+    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_headers = ["content-type", "x-api-key"]
     max_age       = 3600
   }
 }
@@ -247,8 +248,8 @@ resource "aws_apigatewayv2_stage" "default" {
 
   # Cheap abuse guard: the endpoint only hands out short-lived, size-capped upload URLs.
   default_route_settings {
-    throttling_burst_limit = 10
-    throttling_rate_limit  = 5
+    throttling_burst_limit = 40
+    throttling_rate_limit  = 20
   }
 }
 
@@ -256,6 +257,87 @@ resource "aws_lambda_permission" "apigw_invoke_get_upload_url" {
   statement_id  = "AllowApiGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.get_upload_url.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+}
+
+
+# ------------------------------------------------------------- web API (read side of the UI)
+# Shared access key for everything that can reveal a person or start the pipeline (x-api-key header).
+resource "random_password" "api_key" {
+  length  = 32
+  special = false
+}
+
+resource "aws_iam_role" "api" {
+  name               = "${var.project_name}-api"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "api_vpc" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "archive_file" "api" {
+  type        = "zip"
+  source_dir  = "${path.module}/../build/api"
+  output_path = "${path.module}/../build/api.zip"
+}
+
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/aws/lambda/${var.project_name}-api"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "api" {
+  function_name    = "${var.project_name}-api"
+  role             = aws_iam_role.api.arn
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  handler          = "handler.lambda_handler"
+  filename         = data.archive_file.api.output_path
+  source_code_hash = data.archive_file.api.output_base64sha256
+  timeout          = 15
+  memory_size      = 256
+
+  vpc_config {
+    subnet_ids         = data.aws_subnets.default.ids
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+
+  environment {
+    variables = {
+      DB_HOST     = aws_db_instance.main.address
+      DB_PORT     = "5432"
+      DB_NAME     = var.db_name
+      DB_USER     = var.db_username
+      DB_PASSWORD = random_password.db.result
+      API_KEY     = random_password.api_key.result
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.api, aws_iam_role_policy_attachment.api_vpc]
+}
+
+resource "aws_apigatewayv2_integration" "api" {
+  api_id                 = aws_apigatewayv2_api.main.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "api" {
+  for_each  = toset(["GET /summary", "GET /lenders", "GET /users", "GET /users/{id}", "POST /match"])
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = each.value
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_lambda_permission" "apigw_invoke_api" {
+  statement_id  = "AllowApiGatewayInvokeApi"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
 }

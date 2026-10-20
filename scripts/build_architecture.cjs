@@ -46,8 +46,8 @@ const ICONS = {
 // ------------------------------------------------------------------ layout (scene units)
 // lines = [title, subtitle, ...]; icons are drawn at the left (centred on top for `top` boxes)
 const boxes = [
-  { id: 'client', x: 30, y: 70, w: 370, h: 100, c: 'ink', icons: ['chrome'], lines: ['Client', 'Upload page'] },
-  { id: 'apigw', x: 1110, y: 70, w: 460, h: 100, c: 'orange', icons: ['apigw', 'lambda'], lines: ['API Gateway', 'Lambda: get-upload-url'] },
+  { id: 'client', x: 30, y: 70, w: 370, h: 100, c: 'ink', icons: ['chrome'], lines: ['LoanMatch web UI', 'Upload · offers · console'] },
+  { id: 'apigw', x: 1110, y: 70, w: 460, h: 100, c: 'orange', icons: ['apigw', 'lambda'], lines: ['API Gateway', '+ Lambdas: upload, web API'] },
   { id: 's3', x: 30, y: 240, w: 370, h: 100, c: 'orange', icons: ['s3'], lines: ['Amazon S3', 'CSV uploads (presigned)'] },
   { id: 'l2', x: 540, y: 240, w: 370, h: 100, c: 'orange', icons: ['lambda'], lines: ['Lambda: parse-csv', 'VPC · streamed insert'] },
   { id: 'rds', x: 1280, y: 230, w: 290, h: 740, c: 'cyan', top: true, icons: ['rds', 'pg'],

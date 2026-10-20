@@ -64,3 +64,9 @@ output "webhook_secret" {
   value       = random_password.webhook_secret.result
   sensitive   = true
 }
+
+output "api_key" {
+  description = "Access key for the web UI's private routes (sent as the x-api-key header)."
+  value       = random_password.api_key.result
+  sensitive   = true
+}

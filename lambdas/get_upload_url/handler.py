@@ -8,6 +8,7 @@ The batch_id is generated here and embedded in the object key
 (uploads/<batch_id>/<filename>). The parse-csv Lambda recovers it from the key,
 which means this function needs no database access (and no VPC).
 """
+import hmac
 import json
 import os
 import re
@@ -45,7 +46,18 @@ def _safe_filename(name: str) -> str:
     return name[:100]
 
 
+def _authorized(event):
+    """Uploads start the whole pipeline, so when an access key is configured the caller must send it."""
+    key = os.environ.get("API_KEY")
+    if not key:
+        return True   # local / test use without a key
+    supplied = {k.lower(): v for k, v in (event.get("headers") or {}).items()}.get("x-api-key", "")
+    return hmac.compare_digest(supplied.encode(), key.encode())
+
+
 def lambda_handler(event, _context):
+    if not _authorized(event):
+        return _response(401, {"error": "missing or wrong access key"})
     try:
         payload = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:

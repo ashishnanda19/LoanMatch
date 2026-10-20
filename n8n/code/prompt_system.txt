@@ -4,10 +4,10 @@ Return ONLY a JSON object with exactly this shape:
 
 Field rules:
 - employment_types: array using only "Salaried", "Self-Employed", "Business".
-  Salaried employees, government/PSU/defence employees -> "Salaried".
-  Self-employed individuals or professionals (doctors, CAs, etc.) -> "Self-Employed".
-  Business owners, proprietors, traders, MSMEs -> "Business".
-  If the text names no applicant type at all, use all three.
+  Eligibility described through an EMPLOYER (employees of private / public limited companies, MNCs, government, PSU, banks, defence, salary account, employer rating or category) means "Salaried" only.
+  Add "Self-Employed" or "Business" ONLY when the text says the GENERAL personal loan itself is open to self-employed individuals, self-employed professionals, business owners, proprietors, traders, MSMEs or non-salaried applicants.
+  Do NOT add them for a passing mention, for a niche or special-purpose scheme (healthcare, pension, education, vehicle, women-only), or for an offer limited to one profession (for example "also offers loans for doctors").
+  If the text names no applicant type at all, use ["Salaried"].
 - min_income: MINIMUM MONTHLY net income in INR as an integer. Convert annual figures to monthly (divide by 12). null if not stated.
 - min_credit_score: minimum CIBIL / credit score (300-900), only if a number is explicitly stated, otherwise null. Never guess a typical value.
 - min_age / max_age: applicant age in years. For max_age use the stated maximum even if it is "at loan maturity". null if not stated.

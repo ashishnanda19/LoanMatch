@@ -7,7 +7,7 @@ const path = require('path');
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'normalize_extraction.js'), 'utf8');
 
 function run(provider, llmResponses) {
-  const originals = llmResponses.map((_, i) => ({ source_site: 's', product_name: `P${i}`, eligibility_text: 'x' }));
+  const originals = llmResponses.map((_, i) => ({ source_site: 's', product_name: `P${i}`, eligibility_text: 'Open to salaried and self-employed applicants.' }));
   const wrap = (arr) => arr.map((j, i) => ({ json: j, pairedItem: { item: i } }));
   const $input = { all: () => wrap(llmResponses) };
   const $ = () => ({ itemMatching: (i) => wrap(originals)[i] });
@@ -62,9 +62,9 @@ test('identical rules for several types are regrouped into one rule (Bajaj-style
   assert.strictEqual(r.min_credit_score, 685);
 });
 
-test('no applicant type named => applies to all three', () => {
+test('no applicant type named => Salaried only (personal loans are employer-based unless stated)', () => {
   const [r] = run('groq', [groq({ rules: [{ employment_types: [], min_age: 21, max_age: 60 }] })]);
-  assert.deepStrictEqual(r.allowed_employment_types, ['Salaried', 'Self-Employed', 'Business']);
+  assert.deepStrictEqual(r.allowed_employment_types, ['Salaried']);
 });
 
 test('implausible numbers are dropped, not stored', () => {
@@ -124,4 +124,24 @@ test('self-employed implies business; salaried-only stays salaried-only', () => 
   ]);
   assert.deepStrictEqual(a.allowed_employment_types, ['Self-Employed', 'Business']);
   assert.deepStrictEqual(b.allowed_employment_types, ['Salaried']);
+});
+
+function runWithText(provider, eligibilityText, llmResponses) {
+  const originals = llmResponses.map((_, i) => ({ source_site: 's', product_name: `P${i}`, eligibility_text: eligibilityText }));
+  const wrap = (arr) => arr.map((j, i) => ({ json: j, pairedItem: { item: i } }));
+  const fn = new Function('$input', '$', 'URL', `"use strict"; ${SRC.replace('__PROVIDER__', provider)}`);
+  return fn({ all: () => wrap(llmResponses) }, () => ({ itemMatching: (i) => wrap(originals)[i] }), undefined).map((r) => r.json);
+}
+
+test('safety net: a page that never mentions self-employed cannot grant Self-Employed or Business (Axis / Canara case)', () => {
+  const [r] = runWithText('groq', 'Employees of private limited companies and PSUs are eligible. Axis also offers loans for doctors. Age 21 to 60.',
+    [groq({ rules: [{ employment_types: ['Salaried', 'Self-Employed', 'Business'], min_income: 15000, min_age: 21, max_age: 60 }] })]);
+  assert.deepStrictEqual(r.allowed_employment_types, ['Salaried']);
+  assert.deepStrictEqual(r.eligibility_rules[0].employment_types, ['Salaried']);
+});
+
+test('safety net: when the page does mention self-employed applicants the LLM answer is kept', () => {
+  const [r] = runWithText('groq', 'Salaried and self-employed professionals can apply.',
+    [groq({ rules: [{ employment_types: ['Salaried', 'Self-Employed'], min_age: 21 }] })]);
+  assert.deepStrictEqual(r.allowed_employment_types, ['Salaried', 'Self-Employed', 'Business']);
 });

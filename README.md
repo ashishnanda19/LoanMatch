@@ -38,12 +38,12 @@ kept next to the picture above so either can be used.
 ```mermaid
 flowchart TB
     subgraph USER["Users"]
-        UI["Client<br/>Upload page"]
+        UI["LoanMatch web UI<br/>Upload · offers · console"]
         INBOX["Test inboxes<br/>+one / +two aliases"]
     end
 
     subgraph AWS["AWS ap-south-1 · provisioned with Terraform"]
-        APIGW["API Gateway<br/>Lambda: get-upload-url"]
+        APIGW["API Gateway<br/>Lambdas: upload URL + web API"]
         S3[("Amazon S3<br/>CSV uploads")]
         L2["Lambda: parse-csv<br/>VPC · streamed bulk insert"]
         RDS[("Amazon RDS · PostgreSQL 16<br/>users · loan_products · matches<br/>qualitative_reviews · test_recipients")]
@@ -120,15 +120,15 @@ do all per-user work in SQL on numbers. Candidate pairs never leave Postgres, so
 |---|---|---:|---:|
 | naive | every user × every lender record | **450,000** | |
 | 0 · reconcile lenders (Code node) | the same bank on several sites collapses to one record (45 → 34 lenders, 11 merged groups) | 340,000 | <1 s |
-| 1 · envelope pre-filter (SQL) | a permissive min/max per lender (a NULL means "no stated limit") drops the clearly ineligible, written to a staging table | 266,532 | ~5 s |
-| 2 · exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI: Salaried needs ₹30,000, Self-Employed has no income floor | 255,380 | ~2 s |
+| 1 · envelope pre-filter (SQL) | a permissive min/max per lender (a NULL means "no stated limit") drops the clearly ineligible, written to a staging table | 252,563 | ~5 s |
+| 2 · exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI: Salaried needs ₹30,000, Self-Employed has no income floor | 242,095 | ~2 s |
 | 3 · rank, keep top 5 (SQL window function) | flagged-score matches last, then lowest rate, then widest credit-score margin | **50,000** | ~1 s |
 | LLM calls in all of the above | | **0** | |
 
 Whole workflow B on the real 10,000-user batch: **16-18 s** end to end including the network hop to RDS.
 
 **Be honest about where the savings come from.** Most lenders state loose requirements, so the numeric filters only
-remove about a quarter of the pairs (340,000 → 255,380). The big wins are (1) keeping the LLM out of the per-user path
+remove about 29% of the pairs (340,000 → 242,095). The big wins are (1) keeping the LLM out of the per-user path
 entirely, (2) merging duplicate lenders, and (3) ranking to a top 5 so only 50,000 rows are written and mailed.
 
 ### What the LLM does, and how that is made cheap
@@ -158,15 +158,16 @@ Only a change in a lender's text triggers a re-review of that lender.
 infra/                 Terraform: VPC wiring, RDS, S3, Lambdas, API Gateway, n8n EC2, SES, IAM
   serverless.yml       thin Serverless Framework definition of the Lambda layer (see Design Decisions)
 lambdas/
-  get_upload_url/      presigned S3 POST (size-capped, content-type pinned)
+  get_upload_url/      presigned S3 POST (size-capped, content-type pinned, access key required)
   parse_csv/           streams the CSV, validates, bulk-inserts; notifies n8n
-db/migrations/         001-007, idempotent, applied by scripts/migrate.sh
+  api/                 read side of the web UI: summary, lenders, customer lookup, instant match
+db/migrations/         001-008, idempotent, applied by scripts/migrate.sh
 n8n/
   workflows/           A, B, R, C, E (importable JSON)
   code/                Code-node sources + prompts, with Node unit tests in code/test/
   sql/                 every SQL statement the workflows run
   docker-compose.yml   n8n 2.44.4, pinned
-ui/index.html          the upload page
+ui/                    the LoanMatch web app (index.html, styles.css, app.js) and its tests in ui/test/
 scripts/               build, deploy, credentials, seeding, status and progress tools
 docs/                  architecture diagram (png, svg, editable .excalidraw, Mermaid) and the demo-video checklist
 ```
@@ -214,8 +215,8 @@ export WEBHOOK_SECRET=$(terraform -chdir=infra output -raw webhook_secret)   # e
 curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/crawl-now   # ~6 min; ends by starting workflow R
 #    (or POST /webhook/review-now to run only the notes)
 
-# 8. Upload the CSV
-./scripts/write_ui_config.sh && python3 -m http.server 8000 --directory ui   # open localhost:8000
+# 8. Open the web UI (home, instant "Check offers", lenders, and the console where you upload the CSV)
+./scripts/write_ui_config.sh && python3 -m http.server 8000 --directory ui   # open http://localhost:8000
 
 # 9. First time only: choose who gets emailed, then notify
 ./scripts/seed_test_recipients.sh                        # maps 2 real user_ids to your +one/+two aliases
@@ -244,7 +245,8 @@ credential on the nodes that use it.
 |---|---|---|
 | `my_ip_cidr`, `ses_sender_email`, `test_recipient_emails`, `aws_region`, `db_*`, `*_instance_type` | `infra/terraform.tfvars` (gitignored; example provided) | Terraform inputs |
 | `GROQ_API_KEY`, `GEMINI_API_KEY` | your shell, only when running `n8n_credentials.sh` | stored by n8n as encrypted credentials; never written to a file |
-| `UPLOAD_BUCKET`, `MAX_UPLOAD_BYTES` | set on the `get-upload-url` Lambda by Terraform | target bucket, 100 MB cap |
+| `UPLOAD_BUCKET`, `MAX_UPLOAD_BYTES`, `API_KEY` | set on the `get-upload-url` Lambda by Terraform | target bucket, 100 MB cap, and the access key uploads must present |
+| `DB_*`, `API_KEY` | set on the `api` Lambda by Terraform | read-only web API: database access and the access key for private routes |
 | `DB_HOST/PORT/NAME/USER/PASSWORD`, `N8N_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET` | set on the `parse-csv` Lambda by Terraform | database, the private n8n address and the webhook shared secret |
 | `N8N_ENCRYPTION_KEY`, `N8N_HOST`, `WEBHOOK_URL`, `GENERIC_TIMEZONE` | `/opt/n8n/.env` on the EC2 host, generated by Terraform ([template](n8n/.env.example)) | n8n runtime |
 
@@ -260,14 +262,47 @@ terraform -chdir=infra destroy   # tear everything down when finished (stops the
 
 ### Tests
 
-The same checks run on every push in GitHub Actions (`.github/workflows/ci.yml`): both test suites against a
+The same checks run on every push in GitHub Actions (`.github/workflows/ci.yml`): all test suites (including the UI) against a
 Postgres service container, `terraform fmt` and `validate`, and a check that the committed workflow JSON is exactly
 what `build_workflows.py` generates.
 
 ```bash
-node --test n8n/code/test/*.test.js                       # 42 tests: normalisers, reconciliation, email, review flow, alerts
+node --test n8n/code/test/*.test.js                       # 44 tests: normalisers, reconciliation, email, review flow, alerts
 cd lambdas/parse_csv && python3 -m unittest -v test_parse_csv   # 12 tests (loader tests need a local Postgres, see the file header)
+cd lambdas/api && python3 -m unittest -v test_api               # 12 tests (no database needed)
+cd ui/test && npm install && ./run.sh                           # 12 simulated-browser tests of the web UI against a mock API
+./scripts/audit_matches.py                                      # independent recompute of every stored top 5 (see section 6)
 ```
+
+---
+
+## Web UI and API
+
+A dependency-free web app in [`ui/`](ui) (no build step), styled after clickpe.ai: floating pill navbar, Outfit + Poppins,
+`#295BEE` blue with navy and green accents, 24 px cards and soft gradient blobs. It is a design study, not affiliated with ClickPe.
+
+| Page | What it does | Needs the access key |
+|---|---|---|
+| **Home** | Hero, feature cards, today's lowest lender rates and a rate comparison, the 4-step process, FAQ | no |
+| **Check offers** | Type income, score, age and employment type; get the top 5 lenders instantly (same ranking as the batch pipeline) | no |
+| **Lenders** | Searchable catalogue: one record per bank, lowest starting rate, accepted types, minimum score | no |
+| **Console → Overview** | Latest batch with a live pipeline stepper, KPIs, and the funnel (450,000 pairs → 50,000) | yes |
+| **Console → Upload** | Drag-and-drop CSV, progress bar, then the pipeline stepper updates as B, R and C run | yes |
+| **Console → Customers** | Find a person by name or id and see their stored offers and email status (the CSV address is never returned; test inboxes are masked) | yes |
+
+The browser talks to the same HTTP API as the upload flow. `lambdas/api` adds these routes:
+
+| Route | Purpose | Auth |
+|---|---|---|
+| `GET /lenders` | canonical lenders and rates (public web data) | none |
+| `POST /match` | top 5 for one person, via the SQL function `match_user()` | none |
+| `GET /summary` | latest batch, funnel numbers, notes coverage | `x-api-key` |
+| `GET /users?q=` and `GET /users/{id}` | customer lookup and stored offers | `x-api-key` |
+| `POST /upload-url` | presigned upload (starts the pipeline) | `x-api-key` |
+
+The access key is generated by Terraform (`terraform output -raw api_key`); with no key configured the private routes stay
+closed. `match_user()` is checked against the batch pipeline by `scripts/verify_match_user.sh` (3,000 users: 0 differences).
+Every value shown in the UI is inserted as text, never as HTML, so nothing from the database or lender websites can inject markup.
 
 ---
 
@@ -324,6 +359,24 @@ The LLM cost does not grow with users at all (see section 2), so nothing in this
 ---
 
 ## 6. Accuracy and known limitations
+
+### How the output was validated
+
+I checked the emails against the raw CSV and the live lender websites by hand, not against my own database:
+
+1. **CSV → database → email.** The two emailed customers' rows are byte-identical in `data/users.csv` and RDS (all 10,000 rows load, 2,632 distinct emails).
+2. **Rates.** The lowest published rate per lender, re-read from the live Paisabazaar and BankBazaar rate cards, equals every rate in the emails (for example Axis 8.75%, Bandhan 8.86%, Union Bank 8.90%).
+3. **Eligibility.** For each emailed lender, and for the cheaper lenders that were skipped, I read the live eligibility text and checked it against the customer: ICICI's self-employed age band, IDFC FIRST's 760 score for self-employed applicants (so it is correctly absent for a 670 score), Indian Bank's 700 for salaried applicants, Bajaj's own page saying "CIBIL 650 or higher" (the aggregator's 685 is out of date), SBI and Kotak being salaried products.
+4. **Independent recompute.** `scripts/audit_matches.py` re-derives all 10,000 top-5 lists in plain Python: 0 differences.
+
+**What this found, and the fix.** The manual read exposed a real bug: the extraction prompt treated "doctors" as self-employed and
+defaulted to "all three types" when a page named none, so salaried-only products (Axis, Canara) were matched to 6,611 and 2,302
+self-employed or business customers. The prompt now grants those types only when the page says the general loan is open to them,
+and a deterministic check drops them when the page never mentions self-employed applicants. After a re-crawl, Axis is matched to 0
+non-salaried customers, and no match goes to a lender that does not accept the customer's employment type.
+
+Remaining differences I did not "fix": lender detail pages sometimes quote a slightly lower starting rate than the comparison table
+on the same site (Bandhan 8.82% vs 8.86%, Punjab & Sind 9.60% vs 9.90%, Canara 9.70% vs 9.95%); we use the rate-card numbers.
 
 The matching logic is exact and verified: I re-derived every user's top 5 independently for all 10,000 users and found 0 differences. The data behind it is **public web text read by an LLM**, so the output is **indicative, not a guaranteed offer**.
 

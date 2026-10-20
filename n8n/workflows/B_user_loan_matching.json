@@ -113,6 +113,29 @@
       ]
     },
     {
+      "id": "5895f84c-da60-5622-a695-6ff01b15a37f",
+      "name": "Save lender offers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH incoming AS (\n    SELECT key::bigint AS product_id, value::numeric AS rate FROM jsonb_each_text($1::jsonb)\n), gone AS (\n    DELETE FROM lender_offers WHERE product_id NOT IN (SELECT product_id FROM incoming)\n), up AS (\n    INSERT INTO lender_offers (product_id, effective_rate, updated_at)\n    SELECT product_id, rate, now() FROM incoming\n    ON CONFLICT (product_id) DO UPDATE SET effective_rate = EXCLUDED.effective_rate, updated_at = now()\n    RETURNING 1\n)\nSELECT count(*) AS offers_saved FROM up",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Collect canonical product ids').first().json.product_rates) ] }}"
+        }
+      },
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      }
+    },
+    {
       "id": "01266053-4b58-505c-9646-fea664688383",
       "name": "Reset candidates",
       "type": "n8n-nodes-base.postgres",
@@ -397,6 +420,17 @@
       ]
     },
     "Collect canonical product ids": {
+      "main": [
+        [
+          {
+            "node": "Save lender offers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save lender offers": {
       "main": [
         [
           {

@@ -11,6 +11,10 @@
 
 const PROVIDER = '__PROVIDER__'; // 'groq' | 'gemini'
 const TYPES = ['Salaried', 'Self-Employed', 'Business'];
+// Safety net behind the prompt: if the lender's page never mentions self-employed / business /
+// non-salaried applicants anywhere, the LLM must not grant those types (it once added them for "doctors"
+// and for an employer-based product, which matched ~9,000 self-employed users to salaried-only lenders).
+const OTHER_TYPES_MENTIONED = /self[\s-]?employed|\bbusiness(?:es|man|men| owner)|proprietor|entrepreneur|msme|\btraders?\b|partnership|non[\s-]?salaried|professionals?/i;
 
 function responseText(res) {
   if (!res || res.error) return null;
@@ -42,10 +46,11 @@ function normType(t) {
   return null;
 }
 
-function cleanRule(r) {
+function cleanRule(r, allowOtherTypes) {
   if (!r || typeof r !== 'object') return null;
   let types = (Array.isArray(r.employment_types) ? r.employment_types : []).map(normType).filter(Boolean);
-  if (!types.length) types = TYPES.slice(); // text named no applicant type => applies to everyone
+  if (!types.length) types = ['Salaried']; // no applicant type named: personal loans are employer-based unless stated
+  if (!allowOtherTypes) types = ['Salaried'];
   // Indian lenders use "self-employed" to cover business owners too (self-employed
   // professionals AND self-employed non-professionals/businessmen). Our CSV splits them
   // into two categories, so a lender that accepts one accepts the other.
@@ -112,7 +117,8 @@ return $input.all().map((item, i) => {
   const parsed = parseJson(responseText(item.json));
   if (!parsed || !Array.isArray(parsed.rules) || parsed.rules.length === 0) return fail('response was not the expected JSON');
 
-  const cleaned = parsed.rules.map(cleanRule).filter(Boolean);
+  const allowOtherTypes = OTHER_TYPES_MENTIONED.test(String(original.eligibility_text || ''));
+  const cleaned = parsed.rules.map((r) => cleanRule(r, allowOtherTypes)).filter(Boolean);
   if (!cleaned.length) return fail('no usable rules');
   const rules = mergeRules(cleaned);
 

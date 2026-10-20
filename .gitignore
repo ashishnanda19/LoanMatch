@@ -40,3 +40,6 @@ ui/config.js
 
 # Build artifacts
 infra/tfplan
+
+# Node
+node_modules/

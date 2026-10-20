@@ -15,6 +15,22 @@ jobs:
           node-version: 20
       - run: node --test n8n/code/test/*.test.js
 
+  ui-tests:
+    name: web UI tests (simulated browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install
+        working-directory: ui/test
+      - run: ./run.sh
+        working-directory: ui/test
+
   workflows-in-sync:
     name: committed workflow JSON matches the generator
     runs-on: ubuntu-latest

@@ -1,0 +1,7 @@
+{
+  "name": "loanmatch-ui-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "./run.sh" },
+  "devDependencies": { "jsdom": "24.1.3" }
+}

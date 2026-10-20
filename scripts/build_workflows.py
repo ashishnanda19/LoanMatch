@@ -274,6 +274,8 @@ def build_workflow_b():
     pg(f, "Load fresh products", "load_fresh_products.sql", None, (720, 300))
     code_node(f, "Stage 0: reconcile lenders", "reconcile_products.js", (960, 300))
     code_node(f, "Collect canonical product ids", "collect_product_ids.js", (1200, 300))
+    pg(f, "Save lender offers", "save_offers.sql",
+       "[ JSON.stringify($('Collect canonical product ids').first().json.product_rates) ]", (1320, 300))
     pg(f, "Reset candidates", "stage1_reset.sql", "[ " + BATCH + " ]", (1440, 300), always_output=True)
     pg(f, "Stage 1: SQL envelope pre-filter", "stage1_envelope.sql",
        "[ " + BATCH + ", JSON.stringify($('Collect canonical product ids').first().json.product_ids) ]", (1680, 300))
@@ -299,7 +301,8 @@ def build_workflow_b():
     for a, b in [("Batch ready (webhook)", "Validate payload"), ("Validate payload", "Mark batch matching"),
                  ("Mark batch matching", "Load fresh products"), ("Load fresh products", "Stage 0: reconcile lenders"),
                  ("Stage 0: reconcile lenders", "Collect canonical product ids"),
-                 ("Collect canonical product ids", "Reset candidates"), ("Reset candidates", "Stage 1: SQL envelope pre-filter"),
+                 ("Collect canonical product ids", "Save lender offers"), ("Save lender offers", "Reset candidates"),
+                 ("Reset candidates", "Stage 1: SQL envelope pre-filter"),
                  ("Stage 1: SQL envelope pre-filter", "Stage 2: exact per-type rules"),
                  ("Stage 2: exact per-type rules", "Stage 3: rank and keep top lenders"),
                  ("Stage 3: rank and keep top lenders", "Funnel report"), ("Funnel report", "Finish batch"),

@@ -1,11 +1,11 @@
 flowchart TB
     subgraph USER["Users"]
-        UI["Client<br/>Upload page"]
+        UI["LoanMatch web UI<br/>Upload · offers · console"]
         INBOX["Test inboxes<br/>+one / +two aliases"]
     end
 
     subgraph AWS["AWS ap-south-1 · provisioned with Terraform"]
-        APIGW["API Gateway<br/>Lambda: get-upload-url"]
+        APIGW["API Gateway<br/>Lambdas: upload URL + web API"]
         S3[("Amazon S3<br/>CSV uploads")]
         L2["Lambda: parse-csv<br/>VPC · streamed bulk insert"]
         RDS[("Amazon RDS · PostgreSQL 16<br/>users · loan_products · matches<br/>qualitative_reviews · test_recipients")]
