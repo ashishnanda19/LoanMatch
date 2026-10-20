@@ -1,21 +1,20 @@
-# Thin Serverless Framework definition of the two Lambdas, the HTTP API and the
-# S3 trigger -- the same shape that Terraform provisions in ingestion.tf.
+# Serverless Framework definition of the whole function layer: the three Lambdas, the HTTP API with its
+# routes and CORS, and the S3 -> parse-csv trigger. It mirrors what Terraform provisions in ingestion.tf.
 #
 # Division of labour:
-#   * Terraform (infra/*.tf) is the primary deploy path: it owns VPC/SGs, RDS, S3,
-#     IAM, the n8n EC2 host, AND these functions.
-#   * This file lets the function layer be deployed/iterated with the Serverless
-#     Framework on top of Terraform-owned infrastructure. Feed it Terraform's
-#     values via env vars (see README "Deploying with Serverless Framework").
+#   * Terraform (infra/*.tf) owns the VPC and security groups, RDS, the S3 bucket, IAM roles, SES and the
+#     n8n EC2 host. It also deploys these functions and is the path used for the demo.
+#   * This file deploys the same function layer with the Serverless Framework on top of those resources,
+#     reusing Terraform's least-privilege roles, VPC settings and secrets instead of creating new ones.
 #
-# Usage (after `terraform apply` and scripts/build_lambdas.sh):
-#   export TF_UPLOAD_BUCKET=$(terraform output -raw upload_bucket)
-#   ... (see README for the full list)
-#   npx serverless@3 deploy --config serverless.yml
+# Usage (after `terraform apply` and scripts/build_lambdas.sh; see README "Deploying with the Serverless Framework"):
+#   eval "$(./scripts/serverless_env.sh)"
+#   cd infra && npx serverless@3 deploy --stage sls
 #
-# NOTE: deploying with BOTH tools to the same function names will conflict;
-# pick one deploy path per environment (the stage below defaults to "sls" to keep
-# names distinct from Terraform's).
+# Function and API names do not collide with Terraform's: the stage below defaults to "sls", giving
+# "loan-engine-sls-..." instead of "loan-engine-...". The S3 bucket notification does collide, because a bucket
+# has one notification configuration, so run uploads through one stack at a time (see the s3 event below).
+# This file has been validated with `serverless print` but not deployed.
 
 service: loan-engine
 
@@ -30,10 +29,11 @@ provider:
   httpApi:
     cors:
       allowedOrigins: ["*"]
-      allowedHeaders: ["content-type"]
-      allowedMethods: ["POST", "OPTIONS"]
-  # Reuse the least-privilege roles Terraform created instead of letting
-  # Serverless generate broad ones.
+      allowedHeaders: ["content-type", "x-api-key"]
+      allowedMethods: ["GET", "POST", "OPTIONS"]
+      maxAge: 3600
+  # Reuse the least-privilege roles Terraform created (one per function) instead of letting Serverless
+  # generate a broad shared role.
   iam:
     role: ${env:TF_PARSE_CSV_ROLE_ARN}
 
@@ -41,6 +41,7 @@ package:
   individually: true
 
 functions:
+  # Hands out a short-lived presigned S3 POST. No database, no VPC. Requires the x-api-key header.
   getUploadUrl:
     handler: handler.lambda_handler
     timeout: 10
@@ -51,21 +52,24 @@ functions:
     environment:
       UPLOAD_BUCKET: ${env:TF_UPLOAD_BUCKET}
       MAX_UPLOAD_BYTES: "104857600"
+      API_KEY: ${env:TF_API_KEY}
     events:
       - httpApi:
           method: POST
           path: /upload-url
 
+  # Triggered by S3 ObjectCreated. Streams the CSV into RDS, then calls the n8n webhook with a shared secret.
   parseCsv:
     handler: handler.lambda_handler
     timeout: 300
     memorySize: 512
+    role: ${env:TF_PARSE_CSV_ROLE_ARN}
     package:
       artifact: ../build/parse_csv.zip
     vpc:
       securityGroupIds:
         - ${env:TF_LAMBDA_SG_ID}
-      subnetIds: ${env:TF_SUBNET_IDS_JSON}   # e.g. '["subnet-a","subnet-b"]'
+      subnetIds: ${file(./serverless_vars.js):subnetIds}   # TF_SUBNET_IDS="subnet-a,subnet-b"
     environment:
       DB_HOST: ${env:TF_DB_HOST}
       DB_PORT: "5432"
@@ -73,6 +77,7 @@ functions:
       DB_USER: ${env:TF_DB_USER}
       DB_PASSWORD: ${env:TF_DB_PASSWORD}
       N8N_WEBHOOK_URL: ${env:TF_N8N_WEBHOOK_URL}
+      N8N_WEBHOOK_SECRET: ${env:TF_WEBHOOK_SECRET}
     events:
       - s3:
           bucket: ${env:TF_UPLOAD_BUCKET}
@@ -80,4 +85,30 @@ functions:
           rules:
             - prefix: uploads/
             - suffix: .csv
-          existing: true   # bucket is owned by Terraform
+          existing: true   # the bucket is owned by Terraform; this replaces its notification configuration
+
+  # Read side of the web UI: summary, lenders, customer lookup, instant match. Every route needs x-api-key.
+  api:
+    handler: handler.lambda_handler
+    timeout: 15
+    memorySize: 256
+    role: ${env:TF_API_ROLE_ARN}
+    package:
+      artifact: ../build/api.zip
+    vpc:
+      securityGroupIds:
+        - ${env:TF_LAMBDA_SG_ID}
+      subnetIds: ${file(./serverless_vars.js):subnetIds}
+    environment:
+      DB_HOST: ${env:TF_DB_HOST}
+      DB_PORT: "5432"
+      DB_NAME: ${env:TF_DB_NAME}
+      DB_USER: ${env:TF_DB_USER}
+      DB_PASSWORD: ${env:TF_DB_PASSWORD}
+      API_KEY: ${env:TF_API_KEY}
+    events:
+      - httpApi: { method: GET,  path: /summary }
+      - httpApi: { method: GET,  path: /lenders }
+      - httpApi: { method: GET,  path: /users }
+      - httpApi: { method: GET,  path: "/users/{id}" }
+      - httpApi: { method: POST, path: /match }

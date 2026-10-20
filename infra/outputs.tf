@@ -70,3 +70,21 @@ output "api_key" {
   value       = random_password.api_key.result
   sensitive   = true
 }
+
+# ---- values the Serverless Framework definition (serverless.yml) reuses; see scripts/serverless_env.sh
+output "lambda_role_arns" {
+  description = "Least-privilege IAM roles Terraform created for the three functions."
+  value = {
+    get_upload_url = aws_iam_role.get_upload_url.arn
+    parse_csv      = aws_iam_role.parse_csv.arn
+    api            = aws_iam_role.api.arn
+  }
+}
+
+output "lambda_security_group_id" {
+  value = aws_security_group.lambda.id
+}
+
+output "lambda_subnet_ids" {
+  value = data.aws_subnets.default.ids
+}

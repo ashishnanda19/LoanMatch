@@ -156,7 +156,8 @@ Only a change in a lender's text triggers a re-review of that lender.
 
 ```
 infra/                 Terraform: VPC wiring, RDS, S3, Lambdas, API Gateway, n8n EC2, SES, IAM
-  serverless.yml       thin Serverless Framework definition of the Lambda layer (see Design Decisions)
+  serverless.yml       Serverless Framework definition of the Lambda layer: 3 functions, HTTP API, S3 trigger
+  serverless_vars.js   helper variable file for serverless.yml (splits the subnet list)
 lambdas/
   get_upload_url/      presigned S3 POST (size-capped, content-type pinned, access key required)
   parse_csv/           streams the CSV, validates, bulk-inserts; notifies n8n
@@ -169,7 +170,7 @@ n8n/
   docker-compose.yml   n8n 2.44.4, pinned
 ui/                    the LoanMatch web app (index.html, styles.css, app.js) and its tests in ui/test/
 scripts/               build, deploy, credentials, seeding, status and progress tools
-docs/                  architecture diagram (png, svg, editable .excalidraw, Mermaid) and the demo-video checklist
+docs/                  architecture diagram (png, svg, editable .excalidraw, Mermaid), the demo-video checklist and a one-page system explainer
 ```
 
 ---
@@ -228,6 +229,22 @@ curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook
 ```
 
 After step 9, every upload runs the whole chain by itself: upload → Lambda → B → R → C → email.
+
+### Deploying the Lambda layer with the Serverless Framework (alternative to Terraform's Lambdas)
+
+Terraform creates the network, database, bucket, IAM roles, SES and the n8n host, and it deploys the Lambdas too. If you would rather deploy the function layer with the Serverless Framework, [infra/serverless.yml](infra/serverless.yml) defines the same three functions (`getUploadUrl`, `parseCsv`, `api`), the HTTP API routes with CORS, and the S3 trigger. It reuses Terraform's least-privilege roles, security group and secrets instead of creating its own:
+
+```bash
+# 1. Terraform first (network, RDS, bucket, roles), then build the zips
+./scripts/build_lambdas.sh
+terraform -chdir=infra apply
+# 2. Read Terraform's outputs into TF_* variables (printed to your shell only, never to a file)
+eval "$(./scripts/serverless_env.sh)"
+# 3. Deploy; the default stage "sls" names everything loan-engine-sls-...
+cd infra && npx serverless@3 deploy --stage sls
+```
+
+Notes: a bucket has one notification configuration, so send uploads through either stack's `parseCsv`, not both at once. Serverless v3's schema does not list `python3.12` yet, so `serverless print` shows one `provider.runtime` warning; it is only a warning, and 3.12 is what Terraform runs. This file was validated with `serverless print` (all three functions, six routes, subnet list) but **not deployed**.
 
 ### Credentials, exactly as configured in n8n
 
@@ -325,9 +342,10 @@ Every value shown in the UI is inserted as text, never as HTML, so nothing from 
 - **Streamed, chunked load.** `parse-csv` streams the file and inserts 1,000 rows at a time with a single `unnest` statement and `ON CONFLICT DO NOTHING`; the row count is recomputed from the table, so retries are idempotent. The 10,000-row file loads in about 1 s.
 - **`user_id` is the primary key, not email.** The dataset has 10,000 rows but only 2,632 distinct emails, so email would silently drop most users. Notifications are grouped per `user_id`.
 - **Least-privilege networking.** Default VPC with no NAT; an S3 gateway endpoint; separate security groups so RDS accepts only the Lambda, n8n and my IP, and n8n's UI, SSH and webhook accept only my IP and the Lambda.
+- **RDS is publicly addressable, but only from my IP.** `publicly_accessible = true` exists so I can run `psql` and the audit scripts from a laptop without a bastion host. The security group admits only the Lambda, n8n and `my_ip_cidr` (Terraform refuses `0.0.0.0/0`), the volume is encrypted, and connections require TLS. In production I would make it private and reach it through SSM or a bastion.
 
 **Infrastructure**
-- **Terraform is the deploy path; `serverless.yml` is a thin layer on top.** Terraform owns the VPC, RDS, S3, IAM, EC2 and the Lambdas. The assignment lists Serverless Framework for Lambda deployment, so `infra/serverless.yml` defines the same two functions, the HTTP API and the S3 trigger, reusing Terraform's IAM roles. It passes `serverless print` but I never deployed it, because deploying both tools to the same function names would conflict. Pick one deploy path per environment.
+- **Terraform is the deploy path; `serverless.yml` is a full alternative for the function layer.** Terraform owns the VPC, RDS, S3, IAM, SES, EC2 and the Lambdas. The assignment lists Serverless Framework for deployment, so `infra/serverless.yml` defines all three functions, the HTTP API with its routes and CORS, and the S3 trigger, reusing Terraform's IAM roles, security group and secrets (`scripts/serverless_env.sh` reads them from Terraform's outputs). It passes `serverless print` but I never deployed it: both tools would then own the same bucket notification. Use one deploy path per environment.
 - **n8n on a `t3.micro` with docker compose, over plain HTTP.** Good enough for a take-home, with port 5678 locked to my IP and every webhook additionally requiring a shared-secret header (Terraform-generated, held by the Lambda and in an n8n credential), so a stray call from inside the VPC cannot start a run. In production I would put it behind HTTPS (an ALB or Caddy) and a real domain.
 - **DB password as a Lambda environment variable.** Simple and honest for this scope, but the value sits in Terraform state and the function config. Production would use Secrets Manager. State is local and gitignored.
 - **n8n's Postgres credential is TLS-encrypted but not chain-verified.** The n8n credential cannot take a CA bundle; traffic stays inside the VPC. The Lambda does verify the RDS certificate with the bundled CA.
@@ -416,7 +434,7 @@ The matching logic is exact and verified: I re-derived every user's top 5 indepe
 - The "good to know" notes are LLM-written. Spot checks found them faithful, but one framed a list of eligible groups as a condition.
 - Free-tier LLM quotas are small and per model (Gemini ≈ 20 requests/day per model; Groq has per-minute and daily token caps). A throttled review simply retries on the next run, and no match depends on it.
 - The crawler reads three public sources; Policybazaar redirects to Paisabazaar, so Bajaj Finserv's own site is the third.
-- Not exercised live on AWS: the `webhook_failed` path (a failed n8n call from the Lambda) and the `serverless.yml` deployment.
+- Not exercised live on AWS: the `webhook_failed` path (a failed n8n call from the Lambda) and a deployment of `serverless.yml` (it is validated with `serverless print` only).
 
 ---
 
