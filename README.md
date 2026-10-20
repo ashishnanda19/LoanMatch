@@ -337,10 +337,3 @@ The matching logic is exact and verified: I re-derived every user's top 5 indepe
 
 ---
 
-## 7. Repository access
-
-This repository is **private**. The four required reviewers must be invited as collaborators by the repository
-owner (GitHub does not allow this to be scripted from the project): `ujjwalkala-clickpe`, `HarshSrivastav-Dailype`,
-`ManishBiswal-clickpe`, `tushar-clickpe`. Settings → Collaborators → Add people.
-
-After the demo: rotate the Groq and Gemini keys, and run `terraform destroy` to stop AWS charges.
