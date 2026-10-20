@@ -125,8 +125,13 @@ def summary():
                       "WHERE u.batch_id = CAST(:b AS uuid) AND m.notified_at IS NOT NULL", b=str(latest["batch_id"]))[0]["n"]
     totals = rows("SELECT (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM matches) AS matches, "
                   "(SELECT count(*) FROM lender_offers) AS lenders, (SELECT max(last_crawled_at) FROM loan_products) AS last_crawl")[0]
+    # Coverage = segments (fresh lender x accepted employment type) that have a note for the CURRENT page text.
+    # Counting stored note rows instead would include orphans from employment types a lender no longer accepts.
     notes = rows("SELECT count(*) FILTER (WHERE r.criteria_hash = md5('rv5|' || COALESCE(p.raw_criteria_text, ''))) AS current, "
-                 "count(*) AS total FROM qualitative_reviews r JOIN loan_products p USING (product_id)")[0]
+                 "count(*) AS total FROM loan_products p "
+                 "CROSS JOIN LATERAL unnest(COALESCE(p.allowed_employment_types, ARRAY['Salaried', 'Self-Employed', 'Business'])) AS t(employment_type) "
+                 "LEFT JOIN qualitative_reviews r ON r.product_id = p.product_id AND r.employment_type = t.employment_type "
+                 "WHERE p.last_crawled_at > now() - interval '7 days' AND p.qualitative_criteria_text IS NOT NULL")[0]
     return respond(200, {"latest_batch": latest, "emails_sent_for_batch": emails, "recent_batches": batches,
                          "totals": totals, "notes": notes})
 
