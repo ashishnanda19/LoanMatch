@@ -42,6 +42,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "crawl-now",
+        "authentication": "headerAuth",
         "responseMode": "onReceived",
         "options": {}
       },
@@ -49,6 +50,12 @@
         0,
         560
       ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credWebhook000001",
+          "name": "Webhook secret"
+        }
+      },
       "webhookId": "crawl-now-webhook"
     },
     {
@@ -339,19 +346,19 @@
       "typeVersion": 4.2,
       "parameters": {
         "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "contentType": "json",
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } } }) }}",
+        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) }}",
         "options": {
           "timeout": 60000,
           "batching": {
             "batch": {
               "batchSize": 1,
-              "batchInterval": 7000
+              "batchInterval": 5000
             }
           }
         }
@@ -368,8 +375,8 @@
       },
       "onError": "continueRegularOutput",
       "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 15000
+      "maxTries": 2,
+      "waitBetweenTries": 5000
     },
     {
       "id": "9afb3d41-9905-51d8-a66f-941fc1cad87c",
@@ -427,6 +434,20 @@
       "position": [
         3360,
         480
+      ]
+    },
+    {
+      "id": "1c202930-2bca-5bde-a0a9-1f34d5d93343",
+      "name": "Merge extraction results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2
+      },
+      "position": [
+        3360,
+        260
       ]
     },
     {
@@ -633,7 +654,7 @@
       "main": [
         [
           {
-            "node": "Upsert loan product",
+            "node": "Merge extraction results",
             "type": "main",
             "index": 0
           }
@@ -673,14 +694,25 @@
       "main": [
         [
           {
-            "node": "Upsert loan product",
+            "node": "Merge extraction results",
             "type": "main",
-            "index": 0
+            "index": 1
           }
         ],
         [
           {
             "node": "Dropped: both LLMs failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge extraction results": {
+      "main": [
+        [
+          {
+            "node": "Upsert loan product",
             "type": "main",
             "index": 0
           }
@@ -713,7 +745,8 @@
   "active": false,
   "settings": {
     "executionOrder": "v1",
-    "executionTimeout": 3600
+    "executionTimeout": 3600,
+    "errorWorkflow": "workflowE0000001"
   },
   "pinData": {}
 }

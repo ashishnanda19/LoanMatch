@@ -116,5 +116,40 @@ class LoaderTests(unittest.TestCase):
         self.assertIsNone(handler._batch_id_from_key("other/x.csv"))
 
 
+class WebhookTests(unittest.TestCase):
+    """notify_n8n sends the shared secret header, and only when one is configured."""
+
+    def _call(self, env):
+        from unittest import mock
+        seen = {}
+
+        class _Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=0):
+            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+            return _Resp()
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(handler.urllib.request, "urlopen", fake_urlopen):
+            ok = handler.notify_n8n(str(uuid.uuid4()), 10)
+        return ok, seen["headers"]
+
+    def test_secret_header_is_sent(self):
+        ok, h = self._call({"N8N_WEBHOOK_URL": "http://n8n.test/webhook/batch-ready", "N8N_WEBHOOK_SECRET": "s3cret"})
+        self.assertTrue(ok)
+        self.assertEqual(h["x-webhook-secret"], "s3cret")
+
+    def test_no_secret_configured_sends_no_header(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"N8N_WEBHOOK_URL": "http://n8n.test/x"}, clear=False):
+            os.environ.pop("N8N_WEBHOOK_SECRET", None)
+            ok, h = self._call({})
+        self.assertTrue(ok)
+        self.assertNotIn("x-webhook-secret", h)
+
+
 if __name__ == "__main__":
     unittest.main()

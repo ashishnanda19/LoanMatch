@@ -38,6 +38,7 @@ const boxes = [
   { id: 'R', x: 480, y: 830, w: 320, h: 100, c: 'green', lines: ['R · Lender Notes', 'cached LLM · 1 call/lender'] },
   { id: 'C', x: 480, y: 1000, w: 320, h: 100, c: 'green', lines: ['C · Match Notifications', 'one email per user'] },
   { id: 'llm', x: 50, y: 830, w: 280, h: 100, c: 'purple', lines: ['Groq (primary)', 'Gemini (fallback)'] },
+  { id: 'E', x: 50, y: 1000, w: 280, h: 100, c: 'green', lines: ['E · Failure Alerts', 'error workflow of A,B,R,C', 'mails the owner via SES'] },
   { id: 'ses', x: 900, y: 1060, w: 200, h: 80, c: 'orange', lines: ['Amazon SES', 'sandbox'] },
   { id: 'inbox', x: 1180, y: 1060, w: 300, h: 80, c: 'blue', lines: ['Test inbox', '+one / +two aliases only'] },
 ];
@@ -60,7 +61,7 @@ const texts = [
   { id: 'txt_lannot', x: 345, y: 870, s: 18, text: 'annotate' },
   { id: 'txt_lafter', x: 342, y: 668, s: 18, text: 'after a crawl:', color: 'mute' },
   { id: 'txt_lafter2', x: 342, y: 688, s: 18, text: 'all lenders', color: 'mute' },
-  { id: 'txt_lN8N', x: 830, y: 588, s: 20, color: 'green', text: 'B, R, C (and A) run in n8n' },
+  { id: 'txt_lN8N', x: 830, y: 588, s: 20, color: 'green', text: 'A, B, R, C and E run in n8n' },
   { id: 'txt_lN8N2', x: 830, y: 614, s: 20, color: 'green', text: 'on EC2 via docker compose' },
   { id: 'txt_legend1', x: 60, y: 1130, s: 18, color: 'mute', text: 'thin arrow = data    thick = workflow hand-off    dotted = refresh after a crawl' },
   { id: 'txt_legend2', x: 60, y: 1156, s: 18, color: 'mute', text: 'green = n8n workflow (on EC2)    orange = AWS    purple = external LLM    blue = people / public web' },

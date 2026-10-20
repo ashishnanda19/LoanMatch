@@ -19,6 +19,8 @@ OUT = ROOT / "n8n" / "workflows"
 CRED_GROQ = {"httpHeaderAuth": {"id": "credGroq000000001", "name": "Groq API"}}
 CRED_GEMINI = {"httpHeaderAuth": {"id": "credGemini0000001", "name": "Gemini API"}}
 CRED_AWS = {"aws": {"id": "credAwsSes0000001", "name": "AWS SES (send-only)"}}
+CRED_WEBHOOK = {"httpHeaderAuth": {"id": "credWebhook000001", "name": "Webhook secret"}}
+ERROR_WORKFLOW_ID = "workflowE0000001"
 CRED_PG = {"postgres": {"id": "credPostgres00001", "name": "Loan DB (RDS)"}}
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -35,8 +37,8 @@ def nid(workflow: str, name: str) -> str:
 
 
 class Flow:
-    def __init__(self, wf_id: str, name: str):
-        self.id, self.name = wf_id, name
+    def __init__(self, wf_id: str, name: str, error_workflow: str = None):
+        self.id, self.name, self.error_workflow = wf_id, name, error_workflow
         self.nodes, self.conns = [], {}
 
     def add(self, name, type_, version, params, pos, credentials=None, **extra):
@@ -58,6 +60,8 @@ class Flow:
         wf = {"id": self.id, "name": self.name, "nodes": self.nodes, "connections": self.conns,
               "active": False, "settings": {"executionOrder": "v1", "executionTimeout": 3600},
               "pinData": {}}
+        if self.error_workflow:  # failures of this workflow start the alert workflow (E)
+            wf["settings"]["errorWorkflow"] = self.error_workflow
         OUT.mkdir(parents=True, exist_ok=True)
         (OUT / filename).write_text(json.dumps(wf, indent=2, ensure_ascii=False) + "\n")
         print(f"wrote n8n/workflows/{filename} ({len(self.nodes)} nodes)")
@@ -95,7 +99,8 @@ def build_workflow_a(fallback_test=False):
     """fallback_test=True builds a throwaway variant (NOT committed): invalid Groq model and
     only 3 lenders, to prove the Gemini fallback path works end to end."""
     f = Flow("workflowAtest0001" if fallback_test else "workflowA0000001",
-             "TEST - Gemini fallback" if fallback_test else "A - Loan Product Discovery (crawler)")
+             "TEST - Gemini fallback" if fallback_test else "A - Loan Product Discovery (crawler)",
+             error_workflow=None if fallback_test else ERROR_WORKFLOW_ID)
 
     if not fallback_test:
         f.add("Daily schedule", "n8n-nodes-base.scheduleTrigger", 1.2,
@@ -104,8 +109,9 @@ def build_workflow_a(fallback_test=False):
     # On-demand run: curl -X POST http://<n8n>:5678/webhook/crawl-now  (replies immediately)
     f.add("Crawl now (webhook)", "n8n-nodes-base.webhook", 2,
           {"httpMethod": "POST", "path": "crawl-fallback-test" if fallback_test else "crawl-now",
-           "responseMode": "onReceived", "options": {}},
-          (0, 560), webhookId="crawl-fallback-test-wh" if fallback_test else "crawl-now-webhook")
+           "authentication": "headerAuth", "responseMode": "onReceived", "options": {}},
+          (0, 560), credentials=CRED_WEBHOOK,
+          webhookId="crawl-fallback-test-wh" if fallback_test else "crawl-now-webhook")
     code_node(f, "Seed sources", "seed_sources.js", (240, 260))
     http_get(f, "Fetch list page", "={{ $json.list_url }}", (480, 260))
     code_node(f, "Parse lender tables", "parse_lenders.js", (720, 260))
@@ -131,22 +137,15 @@ def build_workflow_a(fallback_test=False):
     code_node(f, "Validate groq output", "normalize_extraction.js", (2160, 200), __PROVIDER__="groq")
     if_node(f, "Groq output valid?", "={{ $json.valid === true }}", (2400, 200))
 
-    # --- Gemini (fallback): only for items Groq failed on ---
-    gem_body = ("={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, "
-                "contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], "
-                "generationConfig: { temperature: 0, responseMimeType: 'application/json', "
-                "thinkingConfig: { thinkingBudget: 0 } } }) }}")
-    f.add("Gemini fallback: extract criteria", "n8n-nodes-base.httpRequest", 4.2, {
-        "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
-        "sendBody": True, "contentType": "json", "specifyBody": "json", "jsonBody": gem_body,
-        "options": {"timeout": 60000, "batching": {"batch": {"batchSize": 1, "batchInterval": 7000}}}},
-          (2640, 360), credentials=CRED_GEMINI,
-          onError="continueRegularOutput", retryOnFail=True, maxTries=3, waitBetweenTries=15000)
+    # --- Gemini (fallback): only for items Groq failed on. Fails fast (2 tries, 5 s apart) so one
+    #     exhausted free-tier quota cannot stall the whole crawl for half an hour. ---
+    gemini_node(f, "Gemini fallback: extract criteria", (2640, 360), 5000, tries=2, wait_ms=5000)
     code_node(f, "Validate gemini output", "normalize_extraction.js", (2880, 360), __PROVIDER__="gemini")
     if_node(f, "Gemini output valid?", "={{ $json.valid === true }}", (3120, 360))
     f.add("Dropped: both LLMs failed", "n8n-nodes-base.noOp", 1, {}, (3360, 480))
+    # n8n runs the Groq branch to the end and then the Gemini branch; without this Merge the save,
+    # the summary and the hand-off to R would each run twice (once per branch).
+    f.add("Merge extraction results", "n8n-nodes-base.merge", 3, {"mode": "append", "numberInputs": 2}, (3360, 260))
 
     # --- Upsert: both valid branches converge here, once per item ---
     row = ("JSON.stringify({ source_site: $json.source_site, product_name: $json.product_name, "
@@ -200,11 +199,12 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     for a, b in [("Build LLM prompt", "Groq: extract criteria"), ("Groq: extract criteria", "Validate groq output"),
                  ("Validate groq output", "Groq output valid?")]:
         f.link(a, b)
-    f.link("Groq output valid?", "Upsert loan product", 0)
+    f.link("Groq output valid?", "Merge extraction results", 0, target_input=0)
     f.link("Groq output valid?", "Gemini fallback: extract criteria", 1)
     f.link("Gemini fallback: extract criteria", "Validate gemini output")
     f.link("Validate gemini output", "Gemini output valid?")
-    f.link("Gemini output valid?", "Upsert loan product", 0)
+    f.link("Gemini output valid?", "Merge extraction results", 0, target_input=1)
+    f.link("Merge extraction results", "Upsert loan product")
     f.link("Gemini output valid?", "Dropped: both LLMs failed", 1)
     f.link("Upsert loan product", "Crawl summary")
     if not fallback_test:
@@ -244,7 +244,7 @@ def groq_node(f, name, pos, interval_ms, max_tokens=600):
         maxTries=3, waitBetweenTries=10000)
 
 
-def gemini_node(f, name, pos, interval_ms, model="gemini-flash-lite-latest"):
+def gemini_node(f, name, pos, interval_ms, model="gemini-flash-lite-latest", tries=3, wait_ms=15000):
     # Free-tier Gemini quotas are per MODEL and small (about 20 requests/day each): gemini-2.5-flash and
     # gemini-2.5-flash-lite were both exhausted by earlier runs. The review is a light annotation task, so
     # it uses the rolling flash-lite alias; if one model runs dry, point this at another model name.
@@ -258,16 +258,17 @@ def gemini_node(f, name, pos, interval_ms, model="gemini-flash-lite-latest"):
         "sendBody": True, "contentType": "json", "specifyBody": "json", "jsonBody": body,
         "options": {"timeout": 60000, "batching": {"batch": {"batchSize": 1, "batchInterval": interval_ms}}}},
         pos, credentials=CRED_GEMINI, onError="continueRegularOutput", retryOnFail=True,
-        maxTries=3, waitBetweenTries=15000)
+        maxTries=tries, waitBetweenTries=wait_ms)
 
 
 def build_workflow_b():
-    f = Flow("workflowB0000001", "B - User-Loan Matching (multi-stage filter)")
+    f = Flow("workflowB0000001", "B - User-Loan Matching (multi-stage filter)", error_workflow=ERROR_WORKFLOW_ID)
     BATCH = "$('Validate payload').first().json.batch_id"
 
     f.add("Batch ready (webhook)", "n8n-nodes-base.webhook", 2,
-          {"httpMethod": "POST", "path": "batch-ready", "responseMode": "onReceived", "options": {}},
-          (0, 300), webhookId="batch-ready-webhook")
+          {"httpMethod": "POST", "path": "batch-ready", "authentication": "headerAuth",
+           "responseMode": "onReceived", "options": {}},
+          (0, 300), credentials=CRED_WEBHOOK, webhookId="batch-ready-webhook")
     code_node(f, "Validate payload", "validate_payload.js", (240, 300))
     pg(f, "Mark batch matching", "mark_matching.sql", "[ $json.batch_id ]", (480, 300))
     pg(f, "Load fresh products", "load_fresh_products.sql", None, (720, 300))
@@ -312,14 +313,15 @@ def build_workflow_b():
 
 # ----------------------------------------------------------------------------- Workflow C
 def build_workflow_c():
-    f = Flow("workflowC0000001", "C - Match Notifications (SES)")
+    f = Flow("workflowC0000001", "C - Match Notifications (SES)", error_workflow=ERROR_WORKFLOW_ID)
     f.add("Executed by Workflow B", "n8n-nodes-base.executeWorkflowTrigger", 1.1,
           {"inputSource": "passthrough"}, (0, 160))
     f.add("Manual trigger", "n8n-nodes-base.manualTrigger", 1, {}, (0, 360))
     # On-demand: curl -X POST http://<n8n>:5678/webhook/notify-now  [-d '{"batch_id": "..."}']
     f.add("Notify now (webhook)", "n8n-nodes-base.webhook", 2,
-          {"httpMethod": "POST", "path": "notify-now", "responseMode": "onReceived", "options": {}},
-          (0, 560), webhookId="notify-now-webhook")
+          {"httpMethod": "POST", "path": "notify-now", "authentication": "headerAuth",
+           "responseMode": "onReceived", "options": {}},
+          (0, 560), credentials=CRED_WEBHOOK, webhookId="notify-now-webhook")
     code_node(f, "Read batch id", "normalize_trigger.js", (240, 360))
     pg(f, "Load pending notifications", "pending_notifications.sql", "[ $json.batch_id ]", (480, 360),
        always_output=True)
@@ -358,14 +360,15 @@ def build_workflow_c():
 
 # ----------------------------------------------------------------------------- Workflow R
 def build_workflow_r():
-    f = Flow("workflowR0000001", "R - Lender Notes (LLM reviews)")
+    f = Flow("workflowR0000001", "R - Lender Notes (LLM reviews)", error_workflow=ERROR_WORKFLOW_ID)
     f.add("Executed by another workflow", "n8n-nodes-base.executeWorkflowTrigger", 1.1,
           {"inputSource": "passthrough"}, (0, 100))
     f.add("Manual trigger", "n8n-nodes-base.manualTrigger", 1, {}, (0, 280))
     # On demand: curl -X POST http://<n8n>:5678/webhook/review-now  [-d '{"scope":"used","batch_id":"..."}']
     f.add("Review now (webhook)", "n8n-nodes-base.webhook", 2,
-          {"httpMethod": "POST", "path": "review-now", "responseMode": "onReceived", "options": {}},
-          (0, 460), webhookId="review-now-webhook")
+          {"httpMethod": "POST", "path": "review-now", "authentication": "headerAuth",
+           "responseMode": "onReceived", "options": {}},
+          (0, 460), credentials=CRED_WEBHOOK, webhookId="review-now-webhook")
     code_node(f, "Read review request", "read_review_request.js", (240, 280))
     pg(f, "Plan reviews (cache check)", "plan_reviews.sql", "[ $json.scope, $json.batch_id ]", (480, 280),
        always_output=True)
@@ -424,6 +427,25 @@ def build_workflow_r():
     f.dump("R_lender_notes.json")
 
 
+# ----------------------------------------------------------------------------- Workflow E
+def build_workflow_e():
+    """Failure alerts. n8n starts this workflow whenever A, B, C or R fails (their settings point here),
+    so a failed run is never silent. It mails the owner's own verified SES address."""
+    f = Flow(ERROR_WORKFLOW_ID, "E - Failure Alerts")   # no error_workflow here: an alert about alerts would loop
+    f.add("Error Trigger", "n8n-nodes-base.errorTrigger", 1, {}, (0, 160))
+    pg(f, "Load alert address", "alert_address.sql", None, (240, 160), always_output=True)
+    code_node(f, "Build alert", "build_alert.js", (480, 160))
+    f.add("Send alert via SES", "n8n-nodes-base.awsSes", 1, {
+        "resource": "email", "operation": "send", "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}", "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}", "isBodyHtml": True, "additionalFields": {}},
+        (720, 160), credentials=CRED_AWS, onError="continueRegularOutput")
+    for a, b in [("Error Trigger", "Load alert address"), ("Load alert address", "Build alert"),
+                 ("Build alert", "Send alert via SES")]:
+        f.link(a, b)
+    f.dump("E_failure_alerts.json")
+
+
 if __name__ == "__main__":
     import sys
     if "--fallback-test" in sys.argv:
@@ -434,3 +456,4 @@ if __name__ == "__main__":
         build_workflow_b()
         build_workflow_c()
         build_workflow_r()
+        build_workflow_e()

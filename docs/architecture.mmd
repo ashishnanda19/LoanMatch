@@ -18,6 +18,7 @@ flowchart TB
         B["B - User-Loan Matching<br/>SQL only, 4 stages, about 17 s"]
         R["R - Lender Notes<br/>cached LLM, 1 call per lender"]
         C["C - Match Notifications<br/>1 email per user"]
+        E["E - Failure Alerts<br/>error workflow of A, B, R, C"]
     end
 
     subgraph WEB["Public sources"]
@@ -47,3 +48,8 @@ flowchart TB
     A -.->|"after a crawl: all lenders"| R
     R <-->|"annotate lender text"| LLM
     R -->|"save notes"| RDS
+    A -.->|"on failure"| E
+    B -.->|"on failure"| E
+    R -.->|"on failure"| E
+    C -.->|"on failure"| E
+    E -->|"alert mail to the owner"| SES

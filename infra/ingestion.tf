@@ -128,6 +128,13 @@ resource "aws_cloudwatch_log_group" "parse_csv" {
   retention_in_days = 14
 }
 
+# Shared secret for n8n's webhooks (Header Auth). Same value goes to the parse-csv Lambda (below) and,
+# via scripts/n8n_webhook_credential.sh, into an n8n credential.
+resource "random_password" "webhook_secret" {
+  length  = 40
+  special = false
+}
+
 resource "aws_lambda_function" "get_upload_url" {
   function_name    = "${var.project_name}-get-upload-url"
   role             = aws_iam_role.get_upload_url.arn
@@ -167,12 +174,13 @@ resource "aws_lambda_function" "parse_csv" {
 
   environment {
     variables = {
-      DB_HOST         = aws_db_instance.main.address
-      DB_PORT         = "5432"
-      DB_NAME         = var.db_name
-      DB_USER         = var.db_username
-      DB_PASSWORD     = random_password.db.result
-      N8N_WEBHOOK_URL = "http://${aws_instance.n8n.private_ip}:5678/webhook/batch-ready"
+      DB_HOST            = aws_db_instance.main.address
+      DB_PORT            = "5432"
+      DB_NAME            = var.db_name
+      DB_USER            = var.db_username
+      DB_PASSWORD        = random_password.db.result
+      N8N_WEBHOOK_URL    = "http://${aws_instance.n8n.private_ip}:5678/webhook/batch-ready"
+      N8N_WEBHOOK_SECRET = random_password.webhook_secret.result
     }
   }
 

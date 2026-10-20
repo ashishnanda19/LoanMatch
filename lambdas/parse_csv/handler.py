@@ -135,11 +135,15 @@ def notify_n8n(batch_id: str, row_count: int) -> bool:
         logger.error("N8N_WEBHOOK_URL not set; cannot notify n8n")
         return False
     body = json.dumps({"batch_id": batch_id, "row_count": row_count}).encode()
+    headers = {"Content-Type": "application/json"}
+    # n8n's webhooks require this shared secret (Header Auth); without it any host that can reach the
+    # port could start a matching run. Terraform generates it and gives it to both sides.
+    secret = os.environ.get("N8N_WEBHOOK_SECRET")
+    if secret:
+        headers["X-Webhook-Secret"] = secret
     for attempt in range(1, WEBHOOK_ATTEMPTS + 1):
         try:
-            req = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-            )
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if 200 <= resp.status < 300:
                     logger.info("n8n webhook accepted batch %s (HTTP %d)", batch_id, resp.status)

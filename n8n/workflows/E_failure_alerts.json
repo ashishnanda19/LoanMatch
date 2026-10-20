@@ -1,0 +1,121 @@
+{
+  "id": "workflowE0000001",
+  "name": "E - Failure Alerts",
+  "nodes": [
+    {
+      "id": "e5ad7ac8-7da0-5185-940b-eab5eb0c023d",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        0,
+        160
+      ]
+    },
+    {
+      "id": "5ecc5ce7-cbb1-51cf-9edf-aef6af4d5e15",
+      "name": "Load alert address",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT value AS alert_to FROM app_settings WHERE key = 'ses_sender_email'",
+        "options": {}
+      },
+      "position": [
+        240,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "7be287c4-f080-5fa5-b3ab-00ed1501b30f",
+      "name": "Build alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Build alert\"\n// Turns the Error Trigger payload into one short, plain email. Anything that came from an error message\n// is HTML-escaped (error text can echo user data) and capped, and the subject stays on one line.\nconst esc = (s) => String(s == null ? '' : s)\n  .replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst oneLine = (s) => String(s == null ? '' : s).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').replace(/\\s+/g, ' ').trim();\n\nconst e = $('Error Trigger').first().json || {};\nconst ex = e.execution || {};\nconst workflow = oneLine((e.workflow && e.workflow.name) || 'unknown workflow').slice(0, 120);\nconst node = oneLine(ex.lastNodeExecuted || (ex.error && ex.error.node && ex.error.node.name) || 'unknown node').slice(0, 120);\nconst message = oneLine((ex.error && ex.error.message) || 'no error message').slice(0, 500);\nconst to = ($input.first() && $input.first().json && $input.first().json.alert_to) || null;\nconst link = typeof ex.url === 'string' && /^https?:\\/\\//.test(ex.url) ? ex.url : null;\n\nconst html =\n  `<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:600px\">` +\n  `<h3 style=\"margin-bottom:4px\">${esc(workflow)} failed</h3>` +\n  `<table style=\"font-size:14px;border-collapse:collapse\">` +\n  `<tr><td style=\"padding:4px 12px 4px 0;color:#6b7280\">Node</td><td>${esc(node)}</td></tr>` +\n  `<tr><td style=\"padding:4px 12px 4px 0;color:#6b7280\">Error</td><td>${esc(message)}</td></tr>` +\n  `<tr><td style=\"padding:4px 12px 4px 0;color:#6b7280\">Execution</td><td>${esc(ex.id || 'n/a')}${link ? ` - <a href=\"${esc(link)}\">open in n8n</a>` : ''}</td></tr>` +\n  `</table></div>`;\n\nreturn [{ json: { to, from: to, subject: `[Loan engine] ${workflow} failed`, html } }];\n"
+      },
+      "position": [
+        480,
+        160
+      ]
+    },
+    {
+      "id": "e95376f8-23f7-55d9-ba69-56a8c597026e",
+      "name": "Send alert via SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}",
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "isBodyHtml": true,
+        "additionalFields": {}
+      },
+      "position": [
+        720,
+        160
+      ],
+      "credentials": {
+        "aws": {
+          "id": "credAwsSes0000001",
+          "name": "AWS SES (send-only)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load alert address",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load alert address": {
+      "main": [
+        [
+          {
+            "node": "Build alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build alert": {
+      "main": [
+        [
+          {
+            "node": "Send alert via SES",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 3600
+  },
+  "pinData": {}
+}

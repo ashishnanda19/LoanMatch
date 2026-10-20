@@ -34,6 +34,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "notify-now",
+        "authentication": "headerAuth",
         "responseMode": "onReceived",
         "options": {}
       },
@@ -41,6 +42,12 @@
         0,
         560
       ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credWebhook000001",
+          "name": "Webhook secret"
+        }
+      },
       "webhookId": "notify-now-webhook"
     },
     {
@@ -440,7 +447,8 @@
   "active": false,
   "settings": {
     "executionOrder": "v1",
-    "executionTimeout": 3600
+    "executionTimeout": 3600,
+    "errorWorkflow": "workflowE0000001"
   },
   "pinData": {}
 }

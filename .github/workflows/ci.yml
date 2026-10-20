@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  node-tests:
+    name: n8n Code-node tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node --test n8n/code/test/*.test.js
+
+  workflows-in-sync:
+    name: committed workflow JSON matches the generator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/build_workflows.py
+      - name: Fail if regenerating changed anything
+        run: git diff --exit-code n8n/workflows
+
+  lambda-tests:
+    name: parse-csv Lambda tests (Postgres service)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: x
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pg8000==1.31.5
+      - name: Apply the base schema
+        run: psql "postgresql://postgres:x@localhost:55432/postgres" -v ON_ERROR_STOP=1 -q -f db/migrations/001_init.sql
+      - name: Run the tests
+        working-directory: lambdas/parse_csv
+        run: python3 -m unittest -v test_parse_csv
+
+  terraform:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=infra fmt -check -recursive
+      - run: terraform -chdir=infra init -backend=false -input=false
+      - run: terraform -chdir=infra validate

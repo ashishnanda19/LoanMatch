@@ -58,3 +58,9 @@ output "ses_secret_access_key" {
   value     = aws_iam_access_key.n8n_ses.secret
   sensitive = true
 }
+
+output "webhook_secret" {
+  description = "Shared secret for n8n webhooks: send it as the X-Webhook-Secret header."
+  value       = random_password.webhook_secret.result
+  sensitive   = true
+}
