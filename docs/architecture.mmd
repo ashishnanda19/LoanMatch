@@ -1,55 +1,54 @@
 flowchart TB
-    subgraph USER["Browser"]
-        UI["Upload page<br/>ui/index.html"]
-        INBOX["Test inbox<br/>+one / +two aliases only"]
+    subgraph USER["Users"]
+        UI["Client<br/>Upload page"]
+        INBOX["Test inboxes<br/>+one / +two aliases"]
     end
 
-    subgraph AWS["AWS ap-south-1 - provisioned by Terraform"]
-        APIGW["API Gateway<br/>POST /upload-url"]
-        L1["Lambda<br/>get-upload-url"]
-        S3[("S3<br/>uploads bucket")]
-        L2["Lambda parse-csv<br/>in VPC, streamed bulk insert"]
-        RDS[("RDS Postgres 16<br/>users, loan_products, matches,<br/>qualitative_reviews, test_recipients")]
-        SES["Amazon SES<br/>sandbox"]
+    subgraph AWS["AWS ap-south-1 · provisioned with Terraform"]
+        APIGW["API Gateway<br/>Lambda: get-upload-url"]
+        S3[("Amazon S3<br/>CSV uploads")]
+        L2["Lambda: parse-csv<br/>VPC · streamed bulk insert"]
+        RDS[("Amazon RDS · PostgreSQL 16<br/>users · loan_products · matches<br/>qualitative_reviews · test_recipients")]
+        SES["Amazon SES<br/>Sandbox"]
     end
 
-    subgraph N8N["n8n on EC2 - docker compose"]
-        A["A - Loan Product Discovery<br/>daily 02:00 + crawl-now<br/>crawl, extract rules"]
-        B["B - User-Loan Matching<br/>SQL only, 4 stages, about 17 s"]
-        R["R - Lender Notes<br/>cached LLM, 1 call per lender"]
-        C["C - Match Notifications<br/>1 email per user"]
-        E["E - Failure Alerts<br/>error workflow of A, B, R, C"]
+    subgraph N8N["n8n on EC2 · Docker Compose"]
+        A["Workflow A · Loan Product Discovery<br/>Daily 02:00 · crawl + rule extraction"]
+        B["Workflow B · User–Loan Matching<br/>SQL pipeline · about 17 s"]
+        R["Workflow R · Lender Notes<br/>Cached LLM notes · 1 call per lender"]
+        C["Workflow C · Match Notifications<br/>One email per user"]
+        E["Workflow E · Failure Alerts<br/>Error workflow of A, B, R, C"]
     end
 
     subgraph WEB["Public sources"]
         PB["Paisabazaar"]
         BB["BankBazaar"]
-        BJ["Bajaj Finserv<br/>official site"]
+        BJ["Bajaj Finserv (official)"]
     end
-    LLM["Groq primary<br/>Gemini fallback"]
+    LLM["LLM providers<br/>Groq · Gemini fallback"]
 
-    UI -->|"1 ask for upload URL"| APIGW --> L1
-    L1 -->|"2 presigned POST"| UI
-    UI -->|"3 CSV straight to S3"| S3
-    S3 -->|"4 ObjectCreated"| L2
-    L2 -->|"5 bulk insert users"| RDS
-    L2 -->|"6 POST /webhook/batch-ready"| B
-    B <-->|"7 filter, rank, write top 5"| RDS
-    B ==>|"8 notes for matched lenders - waits"| R
-    R ==>|"9 then notify"| C
-    C -->|"10 matches + notes"| RDS
-    C -->|"11 one mail per user"| SES --> INBOX
+    UI -->|"1 Request upload URL"| APIGW
+    APIGW -->|"2 Presigned POST URL"| UI
+    UI -->|"3 Upload CSV"| S3
+    S3 -->|"4 S3 event"| L2
+    L2 -->|"5 Insert users"| RDS
+    L2 -->|"6 Webhook (secret header)"| B
+    B <-->|"7 Filter · rank · top 5"| RDS
+    B ==>|"8 Lender notes (waits)"| R
+    R ==>|"9 Then notify"| C
+    C -->|"10 Read matches + notes"| RDS
+    C -->|"11 Send"| SES --> INBOX
 
     PB --> A
     BB --> A
     BJ --> A
-    A -->|"extract eligibility rules"| LLM
-    A -->|"upsert products"| RDS
-    A -.->|"after a crawl: all lenders"| R
-    R <-->|"annotate lender text"| LLM
-    R -->|"save notes"| RDS
-    A -.->|"on failure"| E
-    B -.->|"on failure"| E
-    R -.->|"on failure"| E
-    C -.->|"on failure"| E
-    E -->|"alert mail to the owner"| SES
+    A -->|"Extract rules"| LLM
+    A -->|"Upsert lenders"| RDS
+    A -.->|"After a crawl: all lenders"| R
+    R <-->|"Annotate"| LLM
+    R -->|"Save notes"| RDS
+    A -.->|"On failure"| E
+    B -.->|"On failure"| E
+    R -.->|"On failure"| E
+    C -.->|"On failure"| E
+    E -->|"Alert email to the owner"| SES
