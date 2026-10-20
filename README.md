@@ -21,6 +21,18 @@ Everything is provisioned with Terraform, and the numbers below come from a real
 
 One picture of the whole system: the AWS side, the four n8n workflows (A, B, R, C) and how they hand off.
 
+![Architecture: browser, API Gateway, Lambdas, S3, RDS, SES and the four n8n workflows](docs/architecture.png)
+
+**Reading it:** the numbers 1-11 are what happens on every upload. Thin arrows are data, thick arrows are workflow
+hand-offs (B waits for R, then starts C), and the dotted arrow is the refresh after a crawl. Workflow A runs on its own
+schedule and keeps the lender data fresh. All four workflows read and write the same RDS database.
+
+- Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open it at [excalidraw.com](https://excalidraw.com) via *File, Open*)
+- Regenerate the picture: `npm i roughjs && node scripts/build_architecture.cjs` (layout lives in that one file)
+
+<details>
+<summary>Mermaid version of the same diagram (kept as a fallback; also in <a href="docs/architecture.mmd"><code>docs/architecture.mmd</code></a>)</summary>
+
 ```mermaid
 flowchart TB
     subgraph USER["Browser"]
@@ -73,8 +85,7 @@ flowchart TB
     R -->|"save notes"| RDS
 ```
 
-**Reading it:** thin arrows are data, thick arrows are workflow hand-offs, the dotted arrow is the nightly
-refresh. Steps 1-11 are what happens on every upload; A runs on its own schedule and keeps the lender data fresh.
+</details>
 
 ### The four workflows
 
@@ -151,7 +162,7 @@ n8n/
   docker-compose.yml   n8n 2.44.4, pinned
 ui/index.html          the upload page
 scripts/               build, deploy, credentials, seeding, status and progress tools
-docs/DEMO_CHECKLIST.md demo-video checklist
+docs/                  architecture diagram (png, svg, editable .excalidraw, Mermaid) and the demo-video checklist
 ```
 
 ---

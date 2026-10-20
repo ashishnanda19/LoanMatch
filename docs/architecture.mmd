@@ -1,0 +1,49 @@
+flowchart TB
+    subgraph USER["Browser"]
+        UI["Upload page<br/>ui/index.html"]
+        INBOX["Test inbox<br/>+one / +two aliases only"]
+    end
+
+    subgraph AWS["AWS ap-south-1 - provisioned by Terraform"]
+        APIGW["API Gateway<br/>POST /upload-url"]
+        L1["Lambda<br/>get-upload-url"]
+        S3[("S3<br/>uploads bucket")]
+        L2["Lambda parse-csv<br/>in VPC, streamed bulk insert"]
+        RDS[("RDS Postgres 16<br/>users, loan_products, matches,<br/>qualitative_reviews, test_recipients")]
+        SES["Amazon SES<br/>sandbox"]
+    end
+
+    subgraph N8N["n8n on EC2 - docker compose"]
+        A["A - Loan Product Discovery<br/>daily 02:00 + crawl-now<br/>crawl, extract rules"]
+        B["B - User-Loan Matching<br/>SQL only, 4 stages, about 17 s"]
+        R["R - Lender Notes<br/>cached LLM, 1 call per lender"]
+        C["C - Match Notifications<br/>1 email per user"]
+    end
+
+    subgraph WEB["Public sources"]
+        PB["Paisabazaar"]
+        BB["BankBazaar"]
+        BJ["Bajaj Finserv<br/>official site"]
+    end
+    LLM["Groq primary<br/>Gemini fallback"]
+
+    UI -->|"1 ask for upload URL"| APIGW --> L1
+    L1 -->|"2 presigned POST"| UI
+    UI -->|"3 CSV straight to S3"| S3
+    S3 -->|"4 ObjectCreated"| L2
+    L2 -->|"5 bulk insert users"| RDS
+    L2 -->|"6 POST /webhook/batch-ready"| B
+    B <-->|"7 filter, rank, write top 5"| RDS
+    B ==>|"8 notes for matched lenders - waits"| R
+    R ==>|"9 then notify"| C
+    C -->|"10 matches + notes"| RDS
+    C -->|"11 one mail per user"| SES --> INBOX
+
+    PB --> A
+    BB --> A
+    BJ --> A
+    A -->|"extract eligibility rules"| LLM
+    A -->|"upsert products"| RDS
+    A -.->|"after a crawl: all lenders"| R
+    R <-->|"annotate lender text"| LLM
+    R -->|"save notes"| RDS
