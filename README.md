@@ -2,6 +2,12 @@
 
 Upload a CSV of users, crawl personal-loan products from the web, match each user to the lenders they qualify for, and email their best five. Built for the ClickPe engineering-internship assignment on AWS (ap-south-1) with a self-hosted n8n. The numbers below come from a real run on the supplied 10,000-user file.
 
+## Demo
+
+[![LoanMatch demo video: click to watch on YouTube](https://img.youtube.com/vi/0p6il7LFPqg/maxresdefault.jpg)](https://youtu.be/0p6il7LFPqg)
+
+Walkthrough of the architecture and each n8n workflow, then a live run from CSV upload to an email in a test inbox: [youtu.be/0p6il7LFPqg](https://youtu.be/0p6il7LFPqg).
+
 | | |
 |---|---|
 | Users matched | 10,000 in about 18 s (workflow B); upload to email in about 20 s |
