@@ -1,0 +1,785 @@
+{
+  "id": "workflowR0000001",
+  "name": "R - Lender Notes (LLM reviews)",
+  "nodes": [
+    {
+      "id": "d24f02ec-fabc-5b05-a6d6-7c702ba13c00",
+      "name": "Executed by another workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "position": [
+        0,
+        100
+      ]
+    },
+    {
+      "id": "82019bb9-c678-5783-bad4-60dbecdd6373",
+      "name": "Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        0,
+        280
+      ]
+    },
+    {
+      "id": "aaa8db54-6c36-5b00-a9c2-b334b94590af",
+      "name": "Review now (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "review-now",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "position": [
+        0,
+        460
+      ],
+      "webhookId": "review-now-webhook"
+    },
+    {
+      "id": "929be2f1-0e0d-5ff5-ade3-1a33f4a72f68",
+      "name": "Read review request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Read review request\"\n// Workflow R is started three ways: by Workflow B ({scope:'used', batch_id}), by the crawler / the\n// review-now webhook / a manual run (no scope => 'all').\n//   used : only the lender+employment-type pairs that appear in this batch's matches (blocks the emails)\n//   all  : every fresh lender, so the cache is complete even for an outlier no user has hit yet\nconst j = ($input.first() && $input.first().json) || {};\nconst body = j.body && typeof j.body === 'object' ? j.body : {};\nconst id = String(j.batch_id || body.batch_id || '');\nconst batch_id = /^[0-9a-f-]{36}$/i.test(id) ? id : '';\nconst wanted = j.scope || body.scope;\nconst scope = wanted === 'used' && batch_id ? 'used' : 'all';\nreturn [{ json: { scope, batch_id } }];\n"
+      },
+      "position": [
+        240,
+        280
+      ]
+    },
+    {
+      "id": "5dd7b99e-df96-594a-aed8-f63df26fd2d5",
+      "name": "Plan reviews (cache check)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH used AS (\n    SELECT DISTINCT m.product_id, u.employment_status AS employment_type\n    FROM matches m\n    JOIN users u ON u.user_id = m.user_id\n    WHERE $1 = 'used' AND u.batch_id = NULLIF($2, '')::uuid\n), segs AS (\n    SELECT p.product_id, p.product_name, p.qualitative_criteria_text, p.raw_criteria_text, t.employment_type,\n           md5('rv4|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash\n    FROM loan_products p\n    CROSS JOIN LATERAL unnest(COALESCE(p.allowed_employment_types, ARRAY['Salaried', 'Self-Employed', 'Business'])) AS t(employment_type)\n    WHERE p.last_crawled_at > now() - interval '7 days'\n      AND p.qualitative_criteria_text IS NOT NULL\n      AND ($1 <> 'used' OR EXISTS (SELECT 1 FROM used x WHERE x.product_id = p.product_id AND x.employment_type = t.employment_type))\n)\nSELECT s.product_id, s.product_name, s.qualitative_criteria_text, s.criteria_hash,\n       left(COALESCE(s.raw_criteria_text, ''), 1500)        AS source_text,\n       array_agg(s.employment_type ORDER BY s.employment_type) AS employment_types\nFROM segs s\nLEFT JOIN qualitative_reviews r ON r.product_id = s.product_id AND r.employment_type = s.employment_type\nWHERE r.criteria_hash IS DISTINCT FROM s.criteria_hash\nGROUP BY s.product_id, s.product_name, s.qualitative_criteria_text, s.raw_criteria_text, s.criteria_hash\nORDER BY s.product_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.scope, $json.batch_id ] }}"
+        }
+      },
+      "position": [
+        480,
+        280
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "2f7cc112-71d2-5328-acff-f93fbc339ad6",
+      "name": "Needs LLM review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "9cab2bf9-f6c0-5999-afbd-07f3829344a5",
+              "leftValue": "={{ $json.product_id !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        720,
+        280
+      ]
+    },
+    {
+      "id": "796cf263-a088-55fe-9dd2-9f145f273b41",
+      "name": "No reviews needed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        960,
+        460
+      ]
+    },
+    {
+      "id": "3ae19d9a-4642-5e66-a05c-e9f5bd3c870e",
+      "name": "Assign provider",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Assign provider\"\n// Spreads lenders over BOTH providers so their separate free-tier quotas add up. Gemini flash-lite\n// allows many more requests per minute than Groq allows tokens per minute, so Gemini takes two\n// of every three lenders and Groq one. (n8n runs the two branches one after the other, so the\n// gain comes from the faster pacing the Gemini quota allows, not from simultaneous calls.)\nreturn $input.all().map((item, i) => ({ json: { ...item.json, provider: i % 3 === 0 ? 'groq' : 'gemini' } }));\n"
+      },
+      "position": [
+        960,
+        200
+      ]
+    },
+    {
+      "id": "acc89bbf-1167-517a-9756-489d86f15d07",
+      "name": "Loop over lenders",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "parameters": {
+        "batchSize": 6,
+        "options": {}
+      },
+      "position": [
+        1200,
+        200
+      ]
+    },
+    {
+      "id": "ce57ad2e-5948-5a73-bf0d-da277350e25b",
+      "name": "Build review prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Build review prompt\"\n// One item per LENDER (not per employment type): plan_reviews.sql groups a lender's stale\n// segments, so one call returns a note for each of its employment types. The system prompt and the\n// lender text are sent once instead of up to three times, which is what the free-tier token limit\n// is measured in.\nconst SYSTEM = \"You help explain personal-loan eligibility to customers. Applicants have ALREADY been checked against the lender's numeric rules (monthly income, credit score, age) and the employment types the lender accepts. Your job is only to say how confident the match is and, when relevant, what the customer still needs to check.\\n\\nYou receive: one lender product, the applicant employment types to assess, the lender's qualitative requirements (a summary) and the lender's original source text (ground truth).\\n\\nIMPORTANT: our customer database contains ONLY employment type, monthly income, credit score and age. It has NO information about work experience, employer or employer category, city, education, profession, an existing bank account or relationship, or nationality.\\n\\nYou NEVER reject applicants. Numeric limits and accepted employment types are already decided; do not re-judge them.\\n\\nReturn ONLY a JSON object with one entry for EACH requested employment type, keyed by the exact type name:\\n{\\\"reviews\\\":{\\\"Salaried\\\":{\\\"verdict\\\":\\\"conditional\\\",\\\"caveat\\\":\\\"...\\\"},\\\"Business\\\":{\\\"verdict\\\":\\\"eligible\\\",\\\"caveat\\\":null}}}\\n- verdict \\\"eligible\\\": the qualitative requirements place no extra conditions on this employment type.\\n- verdict \\\"conditional\\\": the applicant may qualify, but it depends on facts missing from our database (work experience, employer type, city, profession, existing bank relationship, account activity, nationality, ...). Name the most important ones in the caveat.\\n- caveat: one plain-English sentence addressed to the customer, at most 140 characters, no jargon; null when the verdict is \\\"eligible\\\". Only state conditions that appear in the lender's text, and say which kind of applicant they apply to; never invent a threshold.\";\n\nreturn $input.all().map(({ json: s }) => ({\n  json: {\n    ...s,\n    system_prompt: SYSTEM,\n    user_prompt:\n      `Lender product: ${s.product_name}\\n` +\n      `Applicant employment types to assess: ${s.employment_types.join(', ')}\\n\\n` +\n      `Lender's qualitative requirements (summary):\\n${s.qualitative_criteria_text}\\n\\n` +\n      `Lender's source eligibility text (ground truth):\\n${s.source_text || '(not available)'}`,\n  },\n}));\n"
+      },
+      "position": [
+        1440,
+        100
+      ]
+    },
+    {
+      "id": "d1b43969-687c-591f-ae18-3fb5364c1074",
+      "name": "Groq lane?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a8b11c6f-76d2-558f-b245-0dc0f1bcb65b",
+              "leftValue": "={{ $json.provider === 'groq' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        1680,
+        100
+      ]
+    },
+    {
+      "id": "8f11c163-192e-55e3-b150-b610fd09cd3a",
+      "name": "Groq: review lender",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-loan-matcher/1.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-oss-120b', temperature: 0, reasoning_effort: 'low', max_completion_tokens: 900, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }] }) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 15000
+            }
+          }
+        }
+      },
+      "position": [
+        1920,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credGroq000000001",
+          "name": "Groq API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000
+    },
+    {
+      "id": "3ee9582c-2eae-51d2-adbf-ce8f0f7553c5",
+      "name": "Validate groq review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Validate <provider> review\"  (stamped per provider by build_workflows.py)\n// One LLM response covers ONE lender and all of its requested employment types. Output is one item\n// per lender: {reviews:[{employment_type, valid, verdict, caveat}], all_valid, extraction_status}.\n// all_valid=false (bad JSON, a missing type, an unknown verdict) sends the lender to the fallback.\nconst PROVIDER = 'groq'; // 'groq' | 'gemini'\n// The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved unreliable on\n// real data (it applied a salaried income floor to self-employed applicants, excluded employment types\n// the lender accepts, and flipped between runs), so 'ineligible' is demoted to 'conditional': numeric\n// rules and employment types are verified exactly in SQL (Stages 1-2), and the LLM must not silently\n// remove a user on its own judgement.\nconst VERDICTS = ['eligible', 'conditional', 'ineligible'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\nconst norm = (s) => String(s).toLowerCase().replace(/[^a-z]/g, '');\n\nfunction reviewOne(entry) {\n  if (!entry || typeof entry !== 'object') return { valid: false };\n  let verdict = typeof entry.verdict === 'string' ? entry.verdict.trim().toLowerCase() : null;\n  if (!VERDICTS.includes(verdict)) return { valid: false };\n  const demoted = verdict === 'ineligible';\n  if (demoted) verdict = 'conditional';\n  let caveat = typeof entry.caveat === 'string' ? entry.caveat.trim() : null;\n  if (caveat && /^(null|none|n\\/a)$/i.test(caveat)) caveat = null;\n  if (caveat && caveat.length > 160) caveat = caveat.slice(0, 157) + '...';\n  if (verdict === 'eligible') caveat = null;\n  if (demoted && !caveat) caveat = 'The lender has extra requirements we could not check.';\n  return { valid: true, verdict, caveat, demoted };\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build review prompt').itemMatching(i).json;\n  const types = original.employment_types;\n  const out = (reviews, status, extra) => ({\n    json: { ...original, reviews, all_valid: reviews.every((r) => r.valid), extraction_status: status, ...extra },\n  });\n  const failAll = (why) => out(types.map((t) => ({ employment_type: t, valid: false })), `invalid_${PROVIDER}`, { llm_error: why });\n\n  if (item.json && item.json.error) return failAll(`request failed: ${JSON.stringify(item.json.error).slice(0, 160)}`);\n  const parsed = parseJson(responseText(item.json));\n  const block = parsed && typeof parsed.reviews === 'object' && parsed.reviews ? parsed.reviews : null;\n  if (!block) return failAll('response was not the expected JSON');\n\n  const byKey = {};\n  Object.keys(block).forEach((k) => { byKey[norm(k)] = block[k]; });\n  const reviews = types.map((t) => ({ employment_type: t, ...reviewOne(byKey[norm(t)]) }));\n  const ok = reviews.every((r) => r.valid);\n  return out(reviews, ok ? `llm_${PROVIDER}` : `invalid_${PROVIDER}`, {});\n});\n"
+      },
+      "position": [
+        2160,
+        0
+      ]
+    },
+    {
+      "id": "660c61c9-d574-52f7-a675-b9a4bd9f8d10",
+      "name": "Groq answer complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "dcf7bc16-ef9c-5d88-ad19-f144a5f1987a",
+              "leftValue": "={{ $json.all_valid === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        2400,
+        0
+      ]
+    },
+    {
+      "id": "2bceb4a8-4922-527f-b556-e6a05011ece6",
+      "name": "Gemini fallback: review lender",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 5000
+            }
+          }
+        }
+      },
+      "position": [
+        2640,
+        100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credGemini0000001",
+          "name": "Gemini API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 15000
+    },
+    {
+      "id": "bb9c32aa-290d-5c5f-8e44-39a347f4eb7f",
+      "name": "Validate gemini fallback review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Validate <provider> review\"  (stamped per provider by build_workflows.py)\n// One LLM response covers ONE lender and all of its requested employment types. Output is one item\n// per lender: {reviews:[{employment_type, valid, verdict, caveat}], all_valid, extraction_status}.\n// all_valid=false (bad JSON, a missing type, an unknown verdict) sends the lender to the fallback.\nconst PROVIDER = 'gemini'; // 'groq' | 'gemini'\n// The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved unreliable on\n// real data (it applied a salaried income floor to self-employed applicants, excluded employment types\n// the lender accepts, and flipped between runs), so 'ineligible' is demoted to 'conditional': numeric\n// rules and employment types are verified exactly in SQL (Stages 1-2), and the LLM must not silently\n// remove a user on its own judgement.\nconst VERDICTS = ['eligible', 'conditional', 'ineligible'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\nconst norm = (s) => String(s).toLowerCase().replace(/[^a-z]/g, '');\n\nfunction reviewOne(entry) {\n  if (!entry || typeof entry !== 'object') return { valid: false };\n  let verdict = typeof entry.verdict === 'string' ? entry.verdict.trim().toLowerCase() : null;\n  if (!VERDICTS.includes(verdict)) return { valid: false };\n  const demoted = verdict === 'ineligible';\n  if (demoted) verdict = 'conditional';\n  let caveat = typeof entry.caveat === 'string' ? entry.caveat.trim() : null;\n  if (caveat && /^(null|none|n\\/a)$/i.test(caveat)) caveat = null;\n  if (caveat && caveat.length > 160) caveat = caveat.slice(0, 157) + '...';\n  if (verdict === 'eligible') caveat = null;\n  if (demoted && !caveat) caveat = 'The lender has extra requirements we could not check.';\n  return { valid: true, verdict, caveat, demoted };\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build review prompt').itemMatching(i).json;\n  const types = original.employment_types;\n  const out = (reviews, status, extra) => ({\n    json: { ...original, reviews, all_valid: reviews.every((r) => r.valid), extraction_status: status, ...extra },\n  });\n  const failAll = (why) => out(types.map((t) => ({ employment_type: t, valid: false })), `invalid_${PROVIDER}`, { llm_error: why });\n\n  if (item.json && item.json.error) return failAll(`request failed: ${JSON.stringify(item.json.error).slice(0, 160)}`);\n  const parsed = parseJson(responseText(item.json));\n  const block = parsed && typeof parsed.reviews === 'object' && parsed.reviews ? parsed.reviews : null;\n  if (!block) return failAll('response was not the expected JSON');\n\n  const byKey = {};\n  Object.keys(block).forEach((k) => { byKey[norm(k)] = block[k]; });\n  const reviews = types.map((t) => ({ employment_type: t, ...reviewOne(byKey[norm(t)]) }));\n  const ok = reviews.every((r) => r.valid);\n  return out(reviews, ok ? `llm_${PROVIDER}` : `invalid_${PROVIDER}`, {});\n});\n"
+      },
+      "position": [
+        2880,
+        100
+      ]
+    },
+    {
+      "id": "97ab2300-37c3-57a5-838d-531003b1b483",
+      "name": "Gemini: review lender",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 5000
+            }
+          }
+        }
+      },
+      "position": [
+        1920,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "credGemini0000001",
+          "name": "Gemini API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 15000
+    },
+    {
+      "id": "33030632-319e-577f-8b86-e8100d027911",
+      "name": "Validate gemini review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Validate <provider> review\"  (stamped per provider by build_workflows.py)\n// One LLM response covers ONE lender and all of its requested employment types. Output is one item\n// per lender: {reviews:[{employment_type, valid, verdict, caveat}], all_valid, extraction_status}.\n// all_valid=false (bad JSON, a missing type, an unknown verdict) sends the lender to the fallback.\nconst PROVIDER = 'gemini'; // 'groq' | 'gemini'\n// The reviewer may only grade a segment 'eligible' or 'conditional'. An LLM veto proved unreliable on\n// real data (it applied a salaried income floor to self-employed applicants, excluded employment types\n// the lender accepts, and flipped between runs), so 'ineligible' is demoted to 'conditional': numeric\n// rules and employment types are verified exactly in SQL (Stages 1-2), and the LLM must not silently\n// remove a user on its own judgement.\nconst VERDICTS = ['eligible', 'conditional', 'ineligible'];\n\nfunction responseText(res) {\n  if (!res || res.error) return null;\n  if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;\n  const parts = res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts;\n  return parts ? parts.map((p) => p.text || '').join('') : null;\n}\nfunction parseJson(t) {\n  if (!t) return null;\n  t = t.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (e) { /* fall through */ }\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (e) { /* give up */ } }\n  return null;\n}\nconst norm = (s) => String(s).toLowerCase().replace(/[^a-z]/g, '');\n\nfunction reviewOne(entry) {\n  if (!entry || typeof entry !== 'object') return { valid: false };\n  let verdict = typeof entry.verdict === 'string' ? entry.verdict.trim().toLowerCase() : null;\n  if (!VERDICTS.includes(verdict)) return { valid: false };\n  const demoted = verdict === 'ineligible';\n  if (demoted) verdict = 'conditional';\n  let caveat = typeof entry.caveat === 'string' ? entry.caveat.trim() : null;\n  if (caveat && /^(null|none|n\\/a)$/i.test(caveat)) caveat = null;\n  if (caveat && caveat.length > 160) caveat = caveat.slice(0, 157) + '...';\n  if (verdict === 'eligible') caveat = null;\n  if (demoted && !caveat) caveat = 'The lender has extra requirements we could not check.';\n  return { valid: true, verdict, caveat, demoted };\n}\n\nreturn $input.all().map((item, i) => {\n  const original = $('Build review prompt').itemMatching(i).json;\n  const types = original.employment_types;\n  const out = (reviews, status, extra) => ({\n    json: { ...original, reviews, all_valid: reviews.every((r) => r.valid), extraction_status: status, ...extra },\n  });\n  const failAll = (why) => out(types.map((t) => ({ employment_type: t, valid: false })), `invalid_${PROVIDER}`, { llm_error: why });\n\n  if (item.json && item.json.error) return failAll(`request failed: ${JSON.stringify(item.json.error).slice(0, 160)}`);\n  const parsed = parseJson(responseText(item.json));\n  const block = parsed && typeof parsed.reviews === 'object' && parsed.reviews ? parsed.reviews : null;\n  if (!block) return failAll('response was not the expected JSON');\n\n  const byKey = {};\n  Object.keys(block).forEach((k) => { byKey[norm(k)] = block[k]; });\n  const reviews = types.map((t) => ({ employment_type: t, ...reviewOne(byKey[norm(t)]) }));\n  const ok = reviews.every((r) => r.valid);\n  return out(reviews, ok ? `llm_${PROVIDER}` : `invalid_${PROVIDER}`, {});\n});\n"
+      },
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "id": "31637051-2e52-50e9-9bd4-33d863d08be2",
+      "name": "Merge review results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 3
+      },
+      "position": [
+        3120,
+        200
+      ]
+    },
+    {
+      "id": "431a00d2-c922-505e-8a19-7461223ee688",
+      "name": "Collect rows to save",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Collect rows to save\"  (runs once per batch of lenders)\n// Flattens the per-lender results into one JSON array for a single upsert query. Only valid\n// segments are saved; a segment that no provider could review is left out and retried next run.\nconst rows = new Map();\nconst items = $input.all().map((i) => i.json);\nfor (const it of items) {\n  const provider = String(it.extraction_status || '').replace(/^(llm|invalid)_/, '');\n  for (const r of it.reviews || []) {\n    if (!r.valid) continue;\n    rows.set(`${it.product_id}|${r.employment_type}`, {\n      product_id: it.product_id, employment_type: r.employment_type, criteria_hash: it.criteria_hash,\n      verdict: r.verdict, caveat: r.caveat, provider: `llm_${provider}`,\n    });\n  }\n}\nreturn [{ json: { rows_json: JSON.stringify([...rows.values()]), lenders: items.length, rows: rows.size } }];\n"
+      },
+      "position": [
+        3360,
+        200
+      ]
+    },
+    {
+      "id": "f4c513ed-0acd-5aae-a5d0-da4c558d27ff",
+      "name": "Upsert reviews",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n    INSERT INTO qualitative_reviews (product_id, employment_type, criteria_hash, verdict, caveat, provider)\n    SELECT x.product_id, x.employment_type, x.criteria_hash, x.verdict, x.caveat, x.provider\n    FROM jsonb_to_recordset($1::jsonb) AS x(product_id bigint, employment_type text, criteria_hash text,\n                                            verdict text, caveat text, provider text)\n    ON CONFLICT (product_id, employment_type) DO UPDATE SET\n        criteria_hash = EXCLUDED.criteria_hash, verdict = EXCLUDED.verdict,\n        caveat = EXCLUDED.caveat, provider = EXCLUDED.provider, reviewed_at = now()\n    RETURNING 1\n)\nSELECT count(*) AS saved FROM ins",
+        "options": {
+          "queryReplacement": "={{ [ $json.rows_json ] }}"
+        }
+      },
+      "position": [
+        3600,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      }
+    },
+    {
+      "id": "f3fdf577-7532-5f81-b0ee-98b315c0c7c5",
+      "name": "Total saved",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Total saved\"  (runs once, when the loop has finished every batch)\n// $input holds one {saved} row per batch.\nreturn [{ json: { reviews_saved: $input.all().reduce((n, i) => n + Number(i.json.saved || 0), 0) } }];\n"
+      },
+      "position": [
+        1440,
+        400
+      ]
+    },
+    {
+      "id": "876d006f-2b0d-5530-9556-993a022e0c31",
+      "name": "Coverage check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH used AS (\n    SELECT DISTINCT m.product_id, u.employment_status AS employment_type\n    FROM matches m\n    JOIN users u ON u.user_id = m.user_id\n    WHERE $1 = 'used' AND u.batch_id = NULLIF($2, '')::uuid\n), segs AS (\n    SELECT p.product_id, p.product_name, p.qualitative_criteria_text, p.raw_criteria_text, t.employment_type,\n           md5('rv4|' || p.qualitative_criteria_text || E'\\n' || COALESCE(p.raw_criteria_text, '')) AS criteria_hash\n    FROM loan_products p\n    CROSS JOIN LATERAL unnest(COALESCE(p.allowed_employment_types, ARRAY['Salaried', 'Self-Employed', 'Business'])) AS t(employment_type)\n    WHERE p.last_crawled_at > now() - interval '7 days'\n      AND p.qualitative_criteria_text IS NOT NULL\n      AND ($1 <> 'used' OR EXISTS (SELECT 1 FROM used x WHERE x.product_id = p.product_id AND x.employment_type = t.employment_type))\n)\nSELECT count(*)                                                    AS segments_in_scope,\n       count(*) FILTER (WHERE r.criteria_hash = s.criteria_hash)   AS with_current_note,\n       count(*) FILTER (WHERE r.criteria_hash IS DISTINCT FROM s.criteria_hash) AS missing\nFROM segs s\nLEFT JOIN qualitative_reviews r ON r.product_id = s.product_id AND r.employment_type = s.employment_type",
+        "options": {
+          "queryReplacement": "={{ [ $('Read review request').first().json.scope, $('Read review request').first().json.batch_id ] }}"
+        }
+      },
+      "position": [
+        1680,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "credPostgres00001",
+          "name": "Loan DB (RDS)"
+        }
+      }
+    },
+    {
+      "id": "1f0a3a8e-0b84-59e2-912b-315352101bcb",
+      "name": "Review summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Review summary\"\nconst planned = $('Plan reviews (cache check)').all().filter((i) => i.json.product_id !== undefined);\nconst cov = $input.first().json;\nconst req = $('Read review request').first().json;\nreturn [{\n  json: {\n    scope: req.scope,\n    lenders_reviewed: planned.length,\n    notes_saved: $('Total saved').first().json.reviews_saved,\n    segments_in_scope: Number(cov.segments_in_scope),\n    segments_with_current_note: Number(cov.with_current_note),\n    segments_still_missing: Number(cov.missing),   // > 0 => a provider failed; retried on the next run\n    finished_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "position": [
+        1920,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Executed by another workflow": {
+      "main": [
+        [
+          {
+            "node": "Read review request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Read review request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review now (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Read review request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read review request": {
+      "main": [
+        [
+          {
+            "node": "Plan reviews (cache check)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan reviews (cache check)": {
+      "main": [
+        [
+          {
+            "node": "Needs LLM review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs LLM review?": {
+      "main": [
+        [
+          {
+            "node": "Assign provider",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No reviews needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign provider": {
+      "main": [
+        [
+          {
+            "node": "Loop over lenders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over lenders": {
+      "main": [
+        [
+          {
+            "node": "Total saved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build review prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build review prompt": {
+      "main": [
+        [
+          {
+            "node": "Groq lane?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq lane?": {
+      "main": [
+        [
+          {
+            "node": "Groq: review lender",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini: review lender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: review lender": {
+      "main": [
+        [
+          {
+            "node": "Validate groq review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate groq review": {
+      "main": [
+        [
+          {
+            "node": "Groq answer complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq answer complete?": {
+      "main": [
+        [
+          {
+            "node": "Merge review results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini fallback: review lender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini fallback: review lender": {
+      "main": [
+        [
+          {
+            "node": "Validate gemini fallback review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate gemini fallback review": {
+      "main": [
+        [
+          {
+            "node": "Merge review results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Gemini: review lender": {
+      "main": [
+        [
+          {
+            "node": "Validate gemini review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate gemini review": {
+      "main": [
+        [
+          {
+            "node": "Merge review results",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge review results": {
+      "main": [
+        [
+          {
+            "node": "Collect rows to save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect rows to save": {
+      "main": [
+        [
+          {
+            "node": "Upsert reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert reviews": {
+      "main": [
+        [
+          {
+            "node": "Loop over lenders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Total saved": {
+      "main": [
+        [
+          {
+            "node": "Coverage check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Coverage check": {
+      "main": [
+        [
+          {
+            "node": "Review summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 3600
+  },
+  "pinData": {}
+}

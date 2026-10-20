@@ -260,6 +260,43 @@
       "alwaysOutputData": true
     },
     {
+      "id": "93174273-17aa-5232-a80b-ee49dac00b70",
+      "name": "Prepare review request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n Code node: \"Prepare review request\"\n// After matching: ask Workflow R for notes on the lenders this batch's users actually matched.\nreturn [{ json: { scope: 'used', batch_id: $('Validate payload').first().json.batch_id } }];\n"
+      },
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "id": "c41f9f98-a9ad-548e-9eec-c992cf3fd219",
+      "name": "Start Workflow R (notes for matched lenders)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "workflowR0000001",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "position": [
+        3360,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
       "id": "8c5e4622-974c-50ad-8017-13a0c618010d",
       "name": "Prepare hand-off",
       "type": "n8n-nodes-base.code",
@@ -269,7 +306,7 @@
         "jsCode": "// n8n Code node: \"Prepare hand-off\"\n// Tells Workflow C which batch just finished, so it emails only that batch's pending matches.\nreturn [{ json: { batch_id: $('Validate payload').first().json.batch_id } }];\n"
       },
       "position": [
-        3120,
+        3600,
         300
       ]
     },
@@ -291,7 +328,7 @@
         }
       },
       "position": [
-        3360,
+        3840,
         300
       ]
     }
@@ -430,6 +467,28 @@
       ]
     },
     "Clean up candidates": {
+      "main": [
+        [
+          {
+            "node": "Prepare review request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare review request": {
+      "main": [
+        [
+          {
+            "node": "Start Workflow R (notes for matched lenders)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Workflow R (notes for matched lenders)": {
       "main": [
         [
           {

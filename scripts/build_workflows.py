@@ -179,31 +179,11 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     code_node(f, "Crawl summary", "crawl_summary.js", (3840, 200))
 
     if not fallback_test:
-        # Qualitative notes are produced HERE, once per lender, not on every CSV upload: the
-        # criteria only change when the crawl does. Unchanged text hits the cache (0 LLM calls).
-        # Run just this half on demand: curl -X POST http://<n8n>:5678/webhook/review-now
-        f.add("Review now (webhook)", "n8n-nodes-base.webhook", 2,
-              {"httpMethod": "POST", "path": "review-now", "responseMode": "onReceived", "options": {}},
-              (3840, 420), webhookId="review-now-webhook")
-        pg(f, "Plan reviews (cache check)", "plan_reviews.sql", None, (4080, 200), always_output=True)
-        if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (4320, 200))
-        f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (4560, 460))
-        # Work through the segments in small batches and save after EACH batch, so a restart or a
-        # rate-limit stall loses at most one batch instead of the whole queue.
-        f.add("Loop over segments", "n8n-nodes-base.splitInBatches", 3, {"batchSize": 6, "options": {}}, (4560, 200))
-        prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
-        code_node(f, "Build review prompt", "build_review_prompt.js", (4800, 100), __SYSTEM_PROMPT__=prompt)
-        groq_node(f, "Groq: review segment", (5040, 100), 14000)
-        code_node(f, "Validate groq review", "normalize_review.js", (5040, 100), __PROVIDER__="groq")
-        if_node(f, "Groq review valid?", "={{ $json.valid === true }}", (5280, 100))
-        gemini_node(f, "Gemini fallback: review segment", (5520, 240), 7000)
-        code_node(f, "Validate gemini review", "normalize_review.js", (5760, 240), __PROVIDER__="gemini")
-        f.add("Merge review results", "n8n-nodes-base.merge", 3, {"mode": "append"}, (6000, 140))
-        rrow = ("JSON.stringify({ product_id: $json.product_id, employment_type: $json.employment_type, "
-                "criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, "
-                "provider: $json.extraction_status, valid: $json.valid === true })")
-        pg(f, "Upsert review", "upsert_review.sql", "[ " + rrow + " ]", (6240, 140))
-        code_node(f, "Review summary", "review_summary.js", (6480, 260))
+        # The qualitative notes are produced by Workflow R (cached, batched). After a crawl, ask it to
+        # fill in every fresh lender; fire and forget so the crawl does not wait on the LLM.
+        f.add("Start Workflow R (lender notes)", "n8n-nodes-base.executeWorkflow", 1.2,
+              {"source": "database", "workflowId": {"__rl": True, "value": "workflowR0000001", "mode": "id"},
+               "mode": "once", "options": {"waitForSubWorkflow": False}}, (4080, 200))
 
     for t in ("Daily schedule", "Manual trigger", "Crawl now (webhook)"):
         if not (fallback_test and t != "Crawl now (webhook)"):
@@ -228,22 +208,7 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     f.link("Gemini output valid?", "Dropped: both LLMs failed", 1)
     f.link("Upsert loan product", "Crawl summary")
     if not fallback_test:
-        f.link("Crawl summary", "Plan reviews (cache check)")
-        f.link("Plan reviews (cache check)", "Needs LLM review?")
-        f.link("Review now (webhook)", "Plan reviews (cache check)")
-        f.link("Needs LLM review?", "Loop over segments", 0)
-        f.link("Needs LLM review?", "No reviews needed", 1)
-        f.link("Loop over segments", "Review summary", 0)          # output 0 = done (all batches saved)
-        f.link("Loop over segments", "Build review prompt", 1)     # output 1 = next batch
-        for a, b in [("Build review prompt", "Groq: review segment"), ("Groq: review segment", "Validate groq review"),
-                     ("Validate groq review", "Groq review valid?")]:
-            f.link(a, b)
-        f.link("Groq review valid?", "Merge review results", 0, target_input=0)
-        f.link("Groq review valid?", "Gemini fallback: review segment", 1)
-        f.link("Gemini fallback: review segment", "Validate gemini review")
-        f.link("Validate gemini review", "Merge review results", 0, target_input=1)
-        for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Loop over segments")]:
-            f.link(a, b)
+        f.link("Crawl summary", "Start Workflow R (lender notes)")
     f.dump("TEST_fallback.json" if fallback_test else "A_loan_product_discovery.json")
 
 
@@ -265,9 +230,9 @@ def pg(f, name, sql_file, params, pos, always_output=False):
                  pos, credentials=CRED_PG, **extra)
 
 
-def groq_node(f, name, pos, interval_ms):
+def groq_node(f, name, pos, interval_ms, max_tokens=600):
     body = ("={{ JSON.stringify({ model: 'openai/gpt-oss-120b', temperature: 0, reasoning_effort: 'low', "
-            "max_completion_tokens: 600, response_format: { type: 'json_object' }, messages: ["
+            "max_completion_tokens: " + str(max_tokens) + ", response_format: { type: 'json_object' }, messages: ["
             "{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }] }) }}")
     return f.add(name, "n8n-nodes-base.httpRequest", 4.2, {
         "method": "POST", "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -279,14 +244,16 @@ def groq_node(f, name, pos, interval_ms):
         maxTries=3, waitBetweenTries=10000)
 
 
-def gemini_node(f, name, pos, interval_ms):
+def gemini_node(f, name, pos, interval_ms, model="gemini-flash-lite-latest"):
+    # Free-tier Gemini quotas are per MODEL and small (about 20 requests/day each): gemini-2.5-flash and
+    # gemini-2.5-flash-lite were both exhausted by earlier runs. The review is a light annotation task, so
+    # it uses the rolling flash-lite alias; if one model runs dry, point this at another model name.
     body = ("={{ JSON.stringify({ systemInstruction: { parts: [{ text: $json.system_prompt }] }, "
             "contents: [{ role: 'user', parts: [{ text: $json.user_prompt }] }], "
-            "generationConfig: { temperature: 0, responseMimeType: 'application/json', "
-            "thinkingConfig: { thinkingBudget: 0 } } }) }}")
+            "generationConfig: { temperature: 0, responseMimeType: 'application/json' } }) }}")
     return f.add(name, "n8n-nodes-base.httpRequest", 4.2, {
         "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
         "sendBody": True, "contentType": "json", "specifyBody": "json", "jsonBody": body,
         "options": {"timeout": 60000, "batching": {"batch": {"batchSize": 1, "batchInterval": interval_ms}}}},
@@ -315,10 +282,18 @@ def build_workflow_b():
     code_node(f, "Funnel report", "funnel_report.js", (2400, 300), __TOP_N__=str(TOP_N))
     pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (2640, 300))
     pg(f, "Clean up candidates", "cleanup_candidates.sql", "[ " + BATCH + " ]", (2880, 300), always_output=True)
-    code_node(f, "Prepare hand-off", "prepare_handoff.js", (3120, 300))
+    # Notes for the lenders THIS batch actually matched are written before any email goes out, so an
+    # outlier lender can never reach a customer without its note. If R fails, emails still go out
+    # (the note column then just shows the generic line).
+    code_node(f, "Prepare review request", "prepare_review_request.js", (3120, 300))
+    f.add("Start Workflow R (notes for matched lenders)", "n8n-nodes-base.executeWorkflow", 1.2,
+          {"source": "database", "workflowId": {"__rl": True, "value": "workflowR0000001", "mode": "id"},
+           "mode": "once", "options": {"waitForSubWorkflow": True}}, (3360, 300),
+          onError="continueRegularOutput")
+    code_node(f, "Prepare hand-off", "prepare_handoff.js", (3600, 300))
     f.add("Start Workflow C (notifications)", "n8n-nodes-base.executeWorkflow", 1.2,
           {"source": "database", "workflowId": {"__rl": True, "value": "workflowC0000001", "mode": "id"},
-           "mode": "once", "options": {"waitForSubWorkflow": False}}, (3360, 300))
+           "mode": "once", "options": {"waitForSubWorkflow": False}}, (3840, 300))
 
     for a, b in [("Batch ready (webhook)", "Validate payload"), ("Validate payload", "Mark batch matching"),
                  ("Mark batch matching", "Load fresh products"), ("Load fresh products", "Stage 0: reconcile lenders"),
@@ -327,7 +302,9 @@ def build_workflow_b():
                  ("Stage 1: SQL envelope pre-filter", "Stage 2: exact per-type rules"),
                  ("Stage 2: exact per-type rules", "Stage 3: rank and keep top lenders"),
                  ("Stage 3: rank and keep top lenders", "Funnel report"), ("Funnel report", "Finish batch"),
-                 ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Prepare hand-off"),
+                 ("Finish batch", "Clean up candidates"), ("Clean up candidates", "Prepare review request"),
+                 ("Prepare review request", "Start Workflow R (notes for matched lenders)"),
+                 ("Start Workflow R (notes for matched lenders)", "Prepare hand-off"),
                  ("Prepare hand-off", "Start Workflow C (notifications)")]:
         f.link(a, b)
     f.dump("B_user_loan_matching.json")
@@ -379,6 +356,74 @@ def build_workflow_c():
     f.dump("C_match_notifications.json")
 
 
+# ----------------------------------------------------------------------------- Workflow R
+def build_workflow_r():
+    f = Flow("workflowR0000001", "R - Lender Notes (LLM reviews)")
+    f.add("Executed by another workflow", "n8n-nodes-base.executeWorkflowTrigger", 1.1,
+          {"inputSource": "passthrough"}, (0, 100))
+    f.add("Manual trigger", "n8n-nodes-base.manualTrigger", 1, {}, (0, 280))
+    # On demand: curl -X POST http://<n8n>:5678/webhook/review-now  [-d '{"scope":"used","batch_id":"..."}']
+    f.add("Review now (webhook)", "n8n-nodes-base.webhook", 2,
+          {"httpMethod": "POST", "path": "review-now", "responseMode": "onReceived", "options": {}},
+          (0, 460), webhookId="review-now-webhook")
+    code_node(f, "Read review request", "read_review_request.js", (240, 280))
+    pg(f, "Plan reviews (cache check)", "plan_reviews.sql", "[ $json.scope, $json.batch_id ]", (480, 280),
+       always_output=True)
+    if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (720, 280))
+    f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (960, 460))
+    code_node(f, "Assign provider", "assign_provider.js", (960, 200))
+    # Work through the lenders in small batches and save after EACH batch, so a restart or a
+    # rate-limit stall loses at most one batch instead of the whole queue.
+    f.add("Loop over lenders", "n8n-nodes-base.splitInBatches", 3, {"batchSize": 6, "options": {}}, (1200, 200))
+    prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
+    code_node(f, "Build review prompt", "build_review_prompt.js", (1440, 100), __SYSTEM_PROMPT__=prompt)
+    if_node(f, "Groq lane?", "={{ $json.provider === 'groq' }}", (1680, 100))
+
+    # Groq lane (one lender in ~15 s: the free tier is token-limited); failures fall back to Gemini
+    groq_node(f, "Groq: review lender", (1920, 0), 15000, max_tokens=900)
+    code_node(f, "Validate groq review", "normalize_review.js", (2160, 0), __PROVIDER__="groq")
+    if_node(f, "Groq answer complete?", "={{ $json.all_valid === true }}", (2400, 0))
+    gemini_node(f, "Gemini fallback: review lender", (2640, 100), 5000)
+    code_node(f, "Validate gemini fallback review", "normalize_review.js", (2880, 100), __PROVIDER__="gemini")
+    # Gemini lane (flash-lite allows ~15 requests/min)
+    gemini_node(f, "Gemini: review lender", (1920, 300), 5000)
+    code_node(f, "Validate gemini review", "normalize_review.js", (2160, 300), __PROVIDER__="gemini")
+
+    f.add("Merge review results", "n8n-nodes-base.merge", 3, {"mode": "append", "numberInputs": 3}, (3120, 200))
+    code_node(f, "Collect rows to save", "collect_review_rows.js", (3360, 200))
+    pg(f, "Upsert reviews", "upsert_reviews.sql", "[ $json.rows_json ]", (3600, 200))
+    code_node(f, "Total saved", "sum_saved.js", (1440, 400))
+    pg(f, "Coverage check", "coverage_check.sql",
+       "[ $('Read review request').first().json.scope, $('Read review request').first().json.batch_id ]", (1680, 400))
+    code_node(f, "Review summary", "review_summary.js", (1920, 400))
+
+    for t in ("Executed by another workflow", "Manual trigger", "Review now (webhook)"):
+        f.link(t, "Read review request")
+    for a, b in [("Read review request", "Plan reviews (cache check)"), ("Plan reviews (cache check)", "Needs LLM review?")]:
+        f.link(a, b)
+    f.link("Needs LLM review?", "Assign provider", 0)
+    f.link("Needs LLM review?", "No reviews needed", 1)
+    f.link("Assign provider", "Loop over lenders")
+    f.link("Loop over lenders", "Total saved", 0)               # output 0 = done (every batch saved)
+    f.link("Loop over lenders", "Build review prompt", 1)       # output 1 = next batch
+    f.link("Build review prompt", "Groq lane?")
+    f.link("Groq lane?", "Groq: review lender", 0)
+    f.link("Groq lane?", "Gemini: review lender", 1)
+    for a, b in [("Groq: review lender", "Validate groq review"), ("Validate groq review", "Groq answer complete?")]:
+        f.link(a, b)
+    f.link("Groq answer complete?", "Merge review results", 0, target_input=0)
+    f.link("Groq answer complete?", "Gemini fallback: review lender", 1)
+    f.link("Gemini fallback: review lender", "Validate gemini fallback review")
+    f.link("Validate gemini fallback review", "Merge review results", 0, target_input=1)
+    f.link("Gemini: review lender", "Validate gemini review")
+    f.link("Validate gemini review", "Merge review results", 0, target_input=2)
+    for a, b in [("Merge review results", "Collect rows to save"), ("Collect rows to save", "Upsert reviews"),
+                 ("Upsert reviews", "Loop over lenders"),
+                 ("Total saved", "Coverage check"), ("Coverage check", "Review summary")]:
+        f.link(a, b)
+    f.dump("R_lender_notes.json")
+
+
 if __name__ == "__main__":
     import sys
     if "--fallback-test" in sys.argv:
@@ -388,3 +433,4 @@ if __name__ == "__main__":
         build_workflow_a()
         build_workflow_b()
         build_workflow_c()
+        build_workflow_r()
