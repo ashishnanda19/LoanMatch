@@ -51,7 +51,7 @@ test('singular wording and empty name fallback', () => {
 test('record_outcome pairs results with emails and flags failures', () => {
   const mails = [{ user_id: 'a', to: 'x', match_ids: [1, 2] }, { user_id: 'b', to: 'y', match_ids: [3] }, { user_id: 'c', to: 'z', match_ids: [4] }];
   const out = exec('record_outcome.js',
-    [{ MessageId: 'm-1' }, { error: { message: 'MessageRejected: not verified' } }, {}],
+    [{ SendEmailResponse: { SendEmailResult: { MessageId: 'm-1' } } }, { error: { message: 'MessageRejected: not verified' } }, {}],
     () => ({ itemMatching: (i) => wrap(mails)[i] }));
   assert.deepStrictEqual(out.map((o) => o.sent), [true, false, false]);
   assert.strictEqual(out[0].message_id, 'm-1');
@@ -65,4 +65,10 @@ test('trigger input: batch id from workflow B, from a webhook body, or empty', (
   assert.strictEqual(exec('normalize_trigger.js', [{ body: { batch_id: id } }])[0].batch_id, id);
   assert.strictEqual(exec('normalize_trigger.js', [{}])[0].batch_id, '');
   assert.strictEqual(exec('normalize_trigger.js', [{ batch_id: "x'; DROP TABLE users;--" }])[0].batch_id, '', 'junk is discarded');
+});
+
+test('record_outcome also accepts a flat MessageId', () => {
+  const out = exec('record_outcome.js', [{ MessageId: 'flat-1' }], () => ({ itemMatching: () => ({ json: { user_id: 'a', to: 'x', match_ids: [1] } }) }));
+  assert.strictEqual(out[0].sent, true);
+  assert.strictEqual(out[0].message_id, 'flat-1');
 });

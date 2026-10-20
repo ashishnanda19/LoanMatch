@@ -25,6 +25,6 @@ LEFT JOIN qualitative_reviews r
       AND r.employment_type = u.employment_status
       AND r.criteria_hash = md5('rv4|' || p.qualitative_criteria_text || E'\n' || COALESCE(p.raw_criteria_text, ''))
 WHERE m.notified_at IS NULL
-  AND ($1 = '' OR u.batch_id = $1::uuid)
+  AND (NULLIF($1, '') IS NULL OR u.batch_id = NULLIF($1, '')::uuid)
 GROUP BY u.user_id, u.name, tr.recipient_email
 ORDER BY u.user_id
