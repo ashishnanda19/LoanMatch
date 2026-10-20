@@ -271,6 +271,10 @@
           const mine = s.recent_batches.find((b) => b.batch_id === batchId);
           const stage = !mine ? 0 : pipelineStage({ latest_batch: mine, emails_sent_for_batch: mine.batch_id === s.latest_batch.batch_id ? s.emails_sent_for_batch : 0 });
           document.getElementById('liveStepper').replaceChildren(stepper(stage));
+          if (mine && mine.status === 'matched' && Number(mine.row_count) === 0) {
+            // Every user_id in the file already exists (inserts skip duplicates), so nothing new was matched or emailed.
+            clearInterval(timer); status.textContent = 'This file added no new customers: every user_id is already in the database, so there was nothing to match.'; toast('No new customers in this file.', true); return;
+          }
           if (stage >= 5 || (mine && ['failed', 'webhook_failed'].includes(mine.status))) { clearInterval(timer); if (stage >= 5) toast('Done: offers were emailed.'); }
         } catch { /* transient: try again on the next tick */ }
       };
