@@ -6,8 +6,11 @@
 //         lender twice in an email, and the strict/lenient disagreement has no right answer.
 //         We keep the single most authoritative record and record what was dropped.
 //
-// Authority order: the lender's own site > the record that states more criteria >
-// aggregator rank (Paisabazaar before BankBazaar) > lower advertised rate.
+// Authority order (which record supplies the ELIGIBILITY RULES): the lender's own site > the
+// record that states more criteria > aggregator rank (Paisabazaar before BankBazaar) > lower rate.
+// The RATE is different: sites disagree (Axis 9.99% vs 8.75%), and a customer cares about the best
+// published rate, so effective_rate is the LOWEST rate any source advertises for the lender.
+// It is shown as "From X%" because advertised rates are starting rates.
 
 const OFFICIAL = new Set(['bajajfinserv']);
 const SOURCE_RANK = { bajajfinserv: 0, paisabazaar: 1, bankbazaar: 2 };
@@ -48,9 +51,12 @@ const out = [];
 for (const [key, rows] of groups) {
   let best = rows[0];
   for (const r of rows.slice(1)) if (better(r, best)) best = r;
+  const rates = rows.map((r) => Number(r.interest_rate)).filter((n) => Number.isFinite(n) && n > 0);
   out.push({
     json: {
       ...best,
+      effective_rate: rates.length ? Math.min(...rates) : null,
+      rates_seen: rows.map((r) => ({ source_site: r.source_site, interest_rate: r.interest_rate })),
       lender_key: key,
       reconciled_from: rows.map((r) => `${r.source_site}#${r.product_id}`),
       products_in_group: rows.length,

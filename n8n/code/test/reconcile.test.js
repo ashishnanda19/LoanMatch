@@ -57,3 +57,24 @@ test('otherwise the record stating more criteria wins; ties go to Paisabazaar', 
   ]);
   assert.strictEqual(b.source_site, 'paisabazaar');
 });
+
+test('the rate used is the lowest published across sources, while rules come from the authoritative record', () => {
+  const [a] = run([
+    { source_site: 'paisabazaar', product_name: 'Axis Bank Personal Loan', interest_rate: 9.99, min_income: 15000, min_age: 21 },
+    { source_site: 'bankbazaar', product_name: 'Axis Bank Personal Loan', interest_rate: 8.75 },
+  ]);
+  assert.strictEqual(a.source_site, 'paisabazaar', 'rules still come from the record with more criteria');
+  assert.strictEqual(a.min_income, 15000);
+  assert.strictEqual(a.effective_rate, 8.75);
+  assert.strictEqual(a.rates_seen.length, 2);
+});
+
+test('missing rates are ignored; no rate anywhere gives null', () => {
+  const [a] = run([
+    { source_site: 'paisabazaar', product_name: 'Foo Personal Loan', interest_rate: null },
+    { source_site: 'bankbazaar', product_name: 'Foo Personal Loan', interest_rate: 11.5 },
+  ]);
+  assert.strictEqual(a.effective_rate, 11.5);
+  const [b] = run([{ source_site: 'paisabazaar', product_name: 'Bar Personal Loan', interest_rate: null }]);
+  assert.strictEqual(b.effective_rate, null);
+});

@@ -181,12 +181,19 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     if not fallback_test:
         # Qualitative notes are produced HERE, once per lender, not on every CSV upload: the
         # criteria only change when the crawl does. Unchanged text hits the cache (0 LLM calls).
+        # Run just this half on demand: curl -X POST http://<n8n>:5678/webhook/review-now
+        f.add("Review now (webhook)", "n8n-nodes-base.webhook", 2,
+              {"httpMethod": "POST", "path": "review-now", "responseMode": "onReceived", "options": {}},
+              (3840, 420), webhookId="review-now-webhook")
         pg(f, "Plan reviews (cache check)", "plan_reviews.sql", None, (4080, 200), always_output=True)
         if_node(f, "Needs LLM review?", "={{ $json.product_id !== undefined }}", (4320, 200))
-        f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (4560, 420))
+        f.add("No reviews needed", "n8n-nodes-base.noOp", 1, {}, (4560, 460))
+        # Work through the segments in small batches and save after EACH batch, so a restart or a
+        # rate-limit stall loses at most one batch instead of the whole queue.
+        f.add("Loop over segments", "n8n-nodes-base.splitInBatches", 3, {"batchSize": 6, "options": {}}, (4560, 200))
         prompt = json.dumps((CODE / "prompt_review_system.txt").read_text().strip())
-        code_node(f, "Build review prompt", "build_review_prompt.js", (4560, 100), __SYSTEM_PROMPT__=prompt)
-        groq_node(f, "Groq: review segment", (4800, 100), 8000)
+        code_node(f, "Build review prompt", "build_review_prompt.js", (4800, 100), __SYSTEM_PROMPT__=prompt)
+        groq_node(f, "Groq: review segment", (5040, 100), 14000)
         code_node(f, "Validate groq review", "normalize_review.js", (5040, 100), __PROVIDER__="groq")
         if_node(f, "Groq review valid?", "={{ $json.valid === true }}", (5280, 100))
         gemini_node(f, "Gemini fallback: review segment", (5520, 240), 7000)
@@ -196,7 +203,7 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
                 "criteria_hash: $json.criteria_hash, verdict: $json.verdict, caveat: $json.caveat, "
                 "provider: $json.extraction_status, valid: $json.valid === true })")
         pg(f, "Upsert review", "upsert_review.sql", "[ " + rrow + " ]", (6240, 140))
-        code_node(f, "Review summary", "review_summary.js", (6480, 140))
+        code_node(f, "Review summary", "review_summary.js", (6480, 260))
 
     for t in ("Daily schedule", "Manual trigger", "Crawl now (webhook)"):
         if not (fallback_test and t != "Crawl now (webhook)"):
@@ -223,8 +230,11 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
     if not fallback_test:
         f.link("Crawl summary", "Plan reviews (cache check)")
         f.link("Plan reviews (cache check)", "Needs LLM review?")
-        f.link("Needs LLM review?", "Build review prompt", 0)
+        f.link("Review now (webhook)", "Plan reviews (cache check)")
+        f.link("Needs LLM review?", "Loop over segments", 0)
         f.link("Needs LLM review?", "No reviews needed", 1)
+        f.link("Loop over segments", "Review summary", 0)          # output 0 = done (all batches saved)
+        f.link("Loop over segments", "Build review prompt", 1)     # output 1 = next batch
         for a, b in [("Build review prompt", "Groq: review segment"), ("Groq: review segment", "Validate groq review"),
                      ("Validate groq review", "Groq review valid?")]:
             f.link(a, b)
@@ -232,7 +242,7 @@ RETURNING product_id, source_site, product_name, interest_rate, allowed_employme
         f.link("Groq review valid?", "Gemini fallback: review segment", 1)
         f.link("Gemini fallback: review segment", "Validate gemini review")
         f.link("Validate gemini review", "Merge review results", 0, target_input=1)
-        for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Review summary")]:
+        for a, b in [("Merge review results", "Upsert review"), ("Upsert review", "Loop over segments")]:
             f.link(a, b)
     f.dump("TEST_fallback.json" if fallback_test else "A_loan_product_discovery.json")
 
@@ -300,7 +310,7 @@ def build_workflow_b():
     pg(f, "Stage 1: SQL envelope pre-filter", "stage1_envelope.sql",
        "[ " + BATCH + ", JSON.stringify($('Collect canonical product ids').first().json.product_ids) ]", (1680, 300))
     pg(f, "Stage 2: exact per-type rules", "stage2_exact.sql", "[ " + BATCH + " ]", (1920, 300))
-    pg(f, "Stage 3: rank and keep top lenders", "stage3_rank_top.sql", "[ " + BATCH + ", " + str(TOP_N) + " ]",
+    pg(f, "Stage 3: rank and keep top lenders", "stage3_rank_top.sql", "[ " + BATCH + ", " + str(TOP_N) + ", JSON.stringify($('Collect canonical product ids').first().json.product_rates) ]",
        (2160, 300))
     code_node(f, "Funnel report", "funnel_report.js", (2400, 300), __TOP_N__=str(TOP_N))
     pg(f, "Finish batch", "finish_batch.sql", "[ $json.batch_id, $json.stats_json ]", (2640, 300))

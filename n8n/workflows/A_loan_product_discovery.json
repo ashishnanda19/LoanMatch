@@ -467,6 +467,23 @@
       ]
     },
     {
+      "id": "2ef76075-d5f5-5f9d-a1f9-86fbbf29f600",
+      "name": "Review now (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "review-now",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "position": [
+        3840,
+        420
+      ],
+      "webhookId": "review-now-webhook"
+    },
+    {
       "id": "3727acb0-efa2-51f1-85a1-42a32e1a57b0",
       "name": "Plan reviews (cache check)",
       "type": "n8n-nodes-base.postgres",
@@ -529,7 +546,21 @@
       "parameters": {},
       "position": [
         4560,
-        420
+        460
+      ]
+    },
+    {
+      "id": "58109067-b92c-55cc-8595-8f62fa235912",
+      "name": "Loop over segments",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "parameters": {
+        "batchSize": 6,
+        "options": {}
+      },
+      "position": [
+        4560,
+        200
       ]
     },
     {
@@ -542,7 +573,7 @@
         "jsCode": "// n8n Code node: \"Build review prompt\"\n// One item per (product x employment-type) segment, produced by plan_reviews.sql. The prompt\n// carries the lender's fuzzy criteria and source text; no applicant data is needed because\n// the model only annotates what the customer still has to check.\nconst SYSTEM = \"You help explain personal-loan eligibility to customers. Applicants have ALREADY been checked against the lender's numeric rules (monthly income, credit score, age) and the employment types the lender accepts. Your job is only to say how confident the match is and, when relevant, what the customer still needs to check.\\n\\nYou receive: the lender product, one applicant employment type, the lender's qualitative requirements (a summary) and the lender's original source text (ground truth).\\n\\nIMPORTANT: our customer database contains ONLY employment type, monthly income, credit score and age. It has NO information about work experience, employer or employer category, city, education, profession, an existing bank account or relationship, or nationality.\\n\\nYou NEVER reject applicants. Numeric limits and accepted employment types are already decided; do not re-judge them.\\n\\nReturn ONLY a JSON object: {\\\"verdict\\\":\\\"conditional\\\",\\\"caveat\\\":\\\"...\\\"}\\n- verdict \\\"eligible\\\": the qualitative requirements place no extra conditions on this employment type.\\n- verdict \\\"conditional\\\": the applicant may qualify, but it depends on facts missing from our database (work experience, employer type, city, profession, existing bank relationship, nationality, ...). Name the most important ones in the caveat.\\n- caveat: one plain-English sentence addressed to the customer, at most 140 characters, no jargon; null when the verdict is \\\"eligible\\\". Only state conditions that appear in the lender's text; never invent a threshold.\";\n\nreturn $input.all().map(({ json: s }) => ({\n  json: {\n    ...s,\n    system_prompt: SYSTEM,\n    user_prompt:\n      `Lender product: ${s.product_name}\\n` +\n      `Applicant employment type: ${s.employment_type}\\n\\n` +\n      `Lender's qualitative requirements (summary):\\n${s.qualitative_criteria_text}\\n\\n` +\n      `Lender's source eligibility text (ground truth):\\n${s.source_text || '(not available)'}`,\n  },\n}));\n"
       },
       "position": [
-        4560,
+        4800,
         100
       ]
     },
@@ -574,13 +605,13 @@
           "batching": {
             "batch": {
               "batchSize": 1,
-              "batchInterval": 8000
+              "batchInterval": 14000
             }
           }
         }
       },
       "position": [
-        4800,
+        5040,
         100
       ],
       "credentials": {
@@ -737,11 +768,11 @@
       "typeVersion": 2,
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// n8n Code node: \"Review summary\"  (runs once, after every review has been saved)\nconst merged = $('Merge review results').all().map((i) => i.json);\nconst count = (st) => merged.filter((m) => m.extraction_status === st).length;\nreturn [{\n  json: {\n    llm_review_calls: merged.length,        // one call (or fallback pair) per segment\n    reviewed_by_groq: count('llm_groq'),\n    reviewed_by_gemini: count('llm_gemini'),\n    review_failed: count('invalid_gemini'), // both models failed => retried on the next crawl\n    reviews_saved: $input.all().reduce((n, i) => n + Number(i.json.saved || 0), 0),\n  },\n}];\n"
+        "jsCode": "// n8n Code node: \"Review summary\"  (runs once, when the loop has saved every batch)\n// $input holds one {saved} item per segment that went through the loop.\nconst planned = $('Plan reviews (cache check)').all().filter((i) => i.json.product_id !== undefined).length;\nconst saved = $input.all().reduce((n, i) => n + Number(i.json.saved || 0), 0);\nreturn [{\n  json: {\n    segments_planned: planned,\n    reviews_saved: saved,\n    reviews_failed: planned - saved,   // both LLMs failed; picked up again on the next run\n    finished_at: new Date().toISOString(),\n  },\n}];\n"
       },
       "position": [
         6480,
-        140
+        260
       ]
     }
   ],
@@ -976,11 +1007,22 @@
         ]
       ]
     },
+    "Review now (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Plan reviews (cache check)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Needs LLM review?": {
       "main": [
         [
           {
-            "node": "Build review prompt",
+            "node": "Loop over segments",
             "type": "main",
             "index": 0
           }
@@ -988,6 +1030,24 @@
         [
           {
             "node": "No reviews needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over segments": {
+      "main": [
+        [
+          {
+            "node": "Review summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build review prompt",
             "type": "main",
             "index": 0
           }
@@ -1082,7 +1142,7 @@
       "main": [
         [
           {
-            "node": "Review summary",
+            "node": "Loop over segments",
             "type": "main",
             "index": 0
           }

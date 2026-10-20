@@ -12,7 +12,7 @@ SELECT u.user_id,
            'match_id', m.match_id,
            'rank',     m.match_rank,
            'product',  p.product_name,
-           'rate',     p.interest_rate,
+           'rate',     COALESCE(m.interest_rate, p.interest_rate),
            'verdict',  r.verdict,
            'caveat',   r.caveat
        ) ORDER BY m.match_rank, m.match_id) AS products

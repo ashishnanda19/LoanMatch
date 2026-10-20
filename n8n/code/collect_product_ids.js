@@ -5,6 +5,8 @@ return [{
   json: {
     batch_id: $('Validate payload').first().json.batch_id,
     product_ids: lenders.map((l) => l.product_id),
+    // product_id -> lowest published rate across sources (what ranking and emails use)
+    product_rates: Object.fromEntries(lenders.map((l) => [l.product_id, l.effective_rate])),
     products_fresh: $('Load fresh products').all().length,
     products_canonical: lenders.length,
     merged_groups: lenders.filter((l) => l.products_in_group > 1).length,
