@@ -12,7 +12,9 @@ w.fetch = (u, o) => fetch(u, o);                     // Node's fetch -> the mock
 w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
 w.HTMLElement.prototype.scrollIntoView = () => {}; w.scrollTo = () => {};
 w.eval(fs.readFileSync(SITE + '/app.js', 'utf8'));
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+// Fixed sleeps are tuned for a laptop; a shared CI runner is several times slower, so stretch them there.
+const SLOW = process.env.CI ? 6 : 1;
+const wait = (ms) => new Promise((r) => setTimeout(r, ms * SLOW));
 const text = () => w.document.getElementById('app').textContent.replace(/\s+/g, ' ');
 const results = [];
 const ok = (name, cond, extra = '') => { results.push(`${cond ? 'PASS' : 'FAIL'}  ${name}${extra ? ' - ' + extra : ''}`); };
