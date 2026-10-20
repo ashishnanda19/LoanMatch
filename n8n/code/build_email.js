@@ -6,7 +6,7 @@
 const esc = (s) => String(s == null ? '' : s)
   .replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const oneLine = (s) => String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
-const rate = (r) => (r === null || r === undefined || r === '' || isNaN(Number(r)) ? 'Rate on request' : `${Number(r).toFixed(2)}% p.a.`);
+const rate = (r) => (r === null || r === undefined || r === '' || isNaN(Number(r)) ? 'Rate on request' : `From ${Number(r).toFixed(2)}% p.a.`);
 
 return $input.all().map(({ json: u }) => {
   const products = Array.isArray(u.products) ? u.products : [];

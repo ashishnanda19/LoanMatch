@@ -25,7 +25,7 @@ test('one email per user with real product names, rates and ids', () => {
   assert.strictEqual(m.from, 'me@gmail.com');
   assert.strictEqual(m.subject, 'Saanvi, your 3 best personal loan matches');
   assert.deepStrictEqual(m.match_ids, [11, 12, 13]);
-  for (const s of ['Bajaj Finance Personal Loan', '10.99% p.a.', '10.50% p.a.', 'Rate on request',
+  for (const s of ['Bajaj Finance Personal Loan', 'From 10.99% p.a.', 'From 10.50% p.a.', 'Rate on request',
     'Needs 2 years of work history.', 'No extra conditions found']) assert.ok(m.html.includes(s), s);
 });
 
