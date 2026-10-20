@@ -209,17 +209,21 @@ GROQ_API_KEY=... GEMINI_API_KEY=... ./scripts/n8n_credentials.sh
 ./scripts/n8n_ses_credential.sh
 ./scripts/n8n_webhook_credential.sh
 ./scripts/n8n_deploy_workflows.sh
-export WEBHOOK_SECRET=$(terraform -chdir=infra output -raw webhook_secret)   # every webhook needs this header
+# every webhook needs this header
+export WEBHOOK_SECRET=$(terraform -chdir=infra output -raw webhook_secret)
 
 # 7. Fetch lender data once, then fill the notes cache
-curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/crawl-now   # ~6 min; ends by starting workflow R
+# ~6 min; ends by starting workflow R
+curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/crawl-now
 #    (or POST /webhook/review-now to run only the notes)
 
 # 8. Open the web UI (home, instant "Check offers", lenders, and the console where you upload the CSV)
-./scripts/write_ui_config.sh && python3 -m http.server 8000 --directory ui   # open http://localhost:8000
+# open http://localhost:8000
+./scripts/write_ui_config.sh && python3 -m http.server 8000 --directory ui
 
 # 9. First time only: choose who gets emailed, then notify
-./scripts/seed_test_recipients.sh                        # maps 2 real user_ids to your +one/+two aliases
+# maps 2 real user_ids to your +one/+two aliases
+./scripts/seed_test_recipients.sh
 curl -X POST -H "X-Webhook-Secret: $WEBHOOK_SECRET" http://<n8n-ip>:5678/webhook/notify-now
 ```
 
@@ -255,9 +259,12 @@ credential on the nodes that use it.
 ### Operating it
 
 ```bash
-./scripts/n8n_status.sh          # live list of workflow runs (or the editor's Executions tab)
-./scripts/watch_reviews.sh       # live progress bar of the lender-notes cache
-terraform -chdir=infra destroy   # tear everything down when finished (stops the AWS cost)
+# live list of workflow runs (or the editor's Executions tab)
+./scripts/n8n_status.sh
+# live progress bar of the lender-notes cache
+./scripts/watch_reviews.sh
+# tear everything down when finished (stops the AWS cost)
+terraform -chdir=infra destroy
 ```
 
 ### Tests
@@ -267,11 +274,16 @@ Postgres service container, `terraform fmt` and `validate`, and a check that the
 what `build_workflows.py` generates.
 
 ```bash
-node --test n8n/code/test/*.test.js                       # 44 tests: normalisers, reconciliation, email, review flow, alerts
-cd lambdas/parse_csv && python3 -m unittest -v test_parse_csv   # 12 tests (loader tests need a local Postgres, see the file header)
-cd lambdas/api && python3 -m unittest -v test_api               # 12 tests (no database needed)
-cd ui/test && npm install && ./run.sh                           # 12 simulated-browser tests of the web UI against a mock API
-./scripts/audit_matches.py                                      # independent recompute of every stored top 5 (see section 6)
+# 44 tests: normalisers, reconciliation, email, review flow, alerts
+node --test n8n/code/test/*.test.js
+# 12 tests (loader tests need a local Postgres, see the file header)
+cd lambdas/parse_csv && python3 -m unittest -v test_parse_csv
+# 12 tests (no database needed)
+cd lambdas/api && python3 -m unittest -v test_api
+# 12 simulated-browser tests of the web UI against a mock API
+cd ui/test && npm install && ./run.sh
+# independent recompute of every stored top 5 (see section 6)
+./scripts/audit_matches.py
 ```
 
 ---
