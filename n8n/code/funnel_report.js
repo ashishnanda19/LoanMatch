@@ -21,6 +21,7 @@ const stats = {
   users_with_a_qualifying_lender: num(s3.users_with_a_match),
   top_n_per_user: __TOP_N__,
   matches_written: num(s3.matches_written),
+  matches_flagged_score: num(s3.matches_flagged_score),
   users_matched: num(s3.users_matched),
   llm_calls_in_this_workflow: 0,
   finished_at: new Date().toISOString(),

@@ -6,6 +6,7 @@
 -- $1 = batch_id, or '' for every pending match
 SELECT u.user_id,
        u.name,
+       u.credit_score,
        tr.recipient_email,
        (SELECT value FROM app_settings WHERE key = 'ses_sender_email') AS sender_email,
        jsonb_agg(jsonb_build_object(
@@ -13,6 +14,9 @@ SELECT u.user_id,
            'rank',     m.match_rank,
            'product',  p.product_name,
            'rate',     COALESCE(m.interest_rate, p.interest_rate),
+           'floor_own', m.score_floor_own,
+           'floor_any', m.score_floor_any,
+           'score_flag', m.score_flag,
            'verdict',  r.verdict,
            'caveat',   r.caveat
        ) ORDER BY m.match_rank, m.match_id) AS products
@@ -26,5 +30,5 @@ LEFT JOIN qualitative_reviews r
       AND r.criteria_hash = md5('rv4|' || p.qualitative_criteria_text || E'\n' || COALESCE(p.raw_criteria_text, ''))
 WHERE m.notified_at IS NULL
   AND (NULLIF($1, '') IS NULL OR u.batch_id = NULLIF($1, '')::uuid)
-GROUP BY u.user_id, u.name, tr.recipient_email
+GROUP BY u.user_id, u.name, u.credit_score, tr.recipient_email
 ORDER BY u.user_id

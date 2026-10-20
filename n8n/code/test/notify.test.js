@@ -11,7 +11,7 @@ const exec = (file, inputs, lookup) =>
     { all: () => wrap(inputs), first: () => wrap(inputs)[0] }, lookup || (() => ({})), undefined).map((r) => r.json);
 
 const user = (over = {}) => ({
-  user_id: 'u1', name: 'Saanvi Shaikh', recipient_email: 'me+one@gmail.com', sender_email: 'me@gmail.com',
+  user_id: 'u1', name: 'Saanvi Shaikh', credit_score: 670, recipient_email: 'me+one@gmail.com', sender_email: 'me@gmail.com',
   products: [
     { match_id: 11, rank: 1, product: 'Bajaj Finance Personal Loan', rate: '10.99', verdict: 'conditional', caveat: 'Needs 2 years of work history.' },
     { match_id: 12, rank: 2, product: 'HDFC Bank Personal Loan', rate: 10.5, verdict: 'eligible', caveat: null },
@@ -71,4 +71,23 @@ test('record_outcome also accepts a flat MessageId', () => {
   const out = exec('record_outcome.js', [{ MessageId: 'flat-1' }], () => ({ itemMatching: () => ({ json: { user_id: 'a', to: 'x', match_ids: [1] } }) }));
   assert.strictEqual(out[0].sent, true);
   assert.strictEqual(out[0].message_id, 'flat-1');
+});
+
+const withProduct = (p) => exec('build_email.js', [user({ products: [{ match_id: 1, rank: 1, product: 'X Bank', rate: 9, ...p }] })])[0].html;
+
+test('credit score: shown at the top, and each row compares it with the lender minimum', () => {
+  const html = exec('build_email.js', [user()])[0].html;
+  assert.ok(html.includes('your credit score: 670'));
+  assert.ok(html.includes('<th style="padding:10px">Credit score</th>'));
+});
+
+test('credit score: flagged when the lender states a higher minimum only for other applicants', () => {
+  const html = withProduct({ score_flag: true, floor_own: null, floor_any: 700 });
+  assert.ok(html.includes('Check:') && html.includes('your score is 670') && html.includes('700 is required for other applicants'));
+});
+
+test('credit score: met, not stated, and not published wordings', () => {
+  assert.ok(withProduct({ floor_own: 650, floor_any: 650 }).includes('Your 670 meets the 650 minimum'));
+  assert.ok(withProduct({ floor_own: null, floor_any: 600 }).includes('Minimum not stated for you; your 670 is above the 600 others need'));
+  assert.ok(withProduct({ floor_own: null, floor_any: null }).includes('Lender does not publish a minimum (your score: 670)'));
 });
