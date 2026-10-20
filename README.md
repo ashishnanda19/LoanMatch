@@ -338,7 +338,7 @@ Every value shown in the UI is inserted as text, never as HTML, so nothing from 
 - **Self-Employed implies Business.** Indian lenders use "self-employed" for professionals and non-professionals alike, while the CSV splits them into two categories, so a lender that accepts one accepts the other.
 - **One record per lender, with an authority order.** The same bank appears on several sites with different thresholds. Eligibility rules come from the lender's own site first, then the record stating more criteria, then Paisabazaar before BankBazaar.
 - **The rate is the lowest published across sources**, shown as "From X%". Aggregators disagree (Axis: 9.99% vs 8.75%) and a customer cares about the best published rate. The rate and the rules can therefore come from different sources.
-- **Unstated is not "no limit".** Indian Bank states a 700 minimum for salaried applicants and nothing for self-employed ones. A 670-score self-employed user is **flagged** ("Check: your score is 670; 700 is required for other applicants"), ranked behind unflagged matches, and the email shows the score against the minimum.
+- **Unstated is not "no limit".** When a lender states a minimum score for one applicant type and nothing for another, a user below that minimum is **flagged** ("Check: your score is 670; 700 is required for other applicants"), ranked behind unflagged matches, and the email shows the score against the minimum. After the extraction audit below, the live lender data happens to contain no such mismatch (flagged matches: 0 of 50,000), so this path is covered by unit tests and `match_user()` checks rather than by live rows.
 - **Top 5, ranked.** Unflagged first, then lowest rate, then the widest credit-score margin. A user receives a short, useful list instead of 34 lenders.
 - **The LLM annotates, it never removes.** A first version let the LLM veto segments; on real data it applied a salaried income floor to self-employed applicants and flipped between runs. So it may only mark a segment `eligible` or `conditional` with a caveat. An "ineligible" answer is demoted. Eligibility is decided only by exact SQL.
 
@@ -378,7 +378,7 @@ I checked the emails against the raw CSV and the live lender websites by hand, n
 
 1. **CSV → database → email.** The two emailed customers' rows are byte-identical in `data/users.csv` and RDS (all 10,000 rows load, 2,632 distinct emails).
 2. **Rates.** The lowest published rate per lender, re-read from the live Paisabazaar and BankBazaar rate cards, equals every rate in the emails (for example Axis 8.75%, Bandhan 8.86%, Union Bank 8.90%).
-3. **Eligibility.** For each emailed lender, and for the cheaper lenders that were skipped, I read the live eligibility text and checked it against the customer: ICICI's self-employed age band, IDFC FIRST's 760 score for self-employed applicants (so it is correctly absent for a 670 score), Indian Bank's 700 for salaried applicants, Bajaj's own page saying "CIBIL 650 or higher" (the aggregator's 685 is out of date), SBI and Kotak being salaried products.
+3. **Eligibility.** For each emailed lender, and for the cheaper lenders that were skipped, I read the live eligibility text and checked it against the customer: ICICI's self-employed age band, IDFC FIRST's 760 score for self-employed applicants (so it is correctly absent for a 670 score), Indian Bank's 700 score floor, Bajaj's own page saying "CIBIL 650 or higher" (the aggregator's 685 is out of date), SBI and Kotak being salaried products.
 4. **Independent recompute.** `scripts/audit_matches.py` re-derives all 10,000 top-5 lists in plain Python: 0 differences.
 
 **What this found, and the fix.** The manual read exposed a real bug: the extraction prompt treated "doctors" as self-employed and
@@ -386,6 +386,24 @@ defaulted to "all three types" when a page named none, so salaried-only products
 self-employed or business customers. The prompt now grants those types only when the page says the general loan is open to them,
 and a deterministic check drops them when the page never mentions self-employed applicants. After a re-crawl, Axis is matched to 0
 non-salaried customers, and no match goes to a lender that does not accept the customer's employment type.
+
+### Lender-by-lender audit of what the LLM is given
+
+A second manual pass compared, for **all 45 lender records** (Paisabazaar, BankBazaar, Bajaj Finserv), the live page text, the text the LLM was actually given, and the rules it returned. It found that the context builder, not the model, was the weak point:
+
+- It kept only the first two sections under an "eligibility"-style heading, so facts under other headings were never seen: IndusInd (BankBazaar) lists age and income under "For salaried employees", Canara under a scheme name ("Canara Ready Cash"), and HDFC and IIFL in an unlabelled "Eligibility Criteria" card. Those lenders reached the LLM with 67-700 characters of context and came back with no usable rules.
+- Rate tables ("Credit Score-Based Risk Grade | Interest Rates") passed its key-facts filter and filled the context with noise.
+- Advice such as "a score of 700 or above gives higher chances" was sometimes returned as a minimum credit score (Yes Bank, DMI Finance, PNB), which would wrongly flag or reject users.
+
+Fixes: the context builder now (a) skips rate and fee tables, (b) caps each heading section so one long section cannot crowd out the rest, and (c) sweeps the whole page for sentences stating an eligibility fact, dropping sentences that repeat across five or more pages (site boilerplate), amounts, tenures and rates. The prompt states that soft guidance and "most lenders" statements are not requirements, and a deterministic guard drops any credit-score floor that is not backed by a non-advisory sentence in the context. Each has a unit test (`n8n/code/test/`).
+
+Result after a full re-crawl: the median context grew from 743 to about 1,160 characters (none hit the 3,500 cap), the rules of 15 of the 45 records changed, and every change was checked against the page. IndusInd now has income ≥ 25,000 and age 21-65, Canara income ≥ 50,000 and age 21-55, HDFC gained its self-employed rule (income ≥ 20,000, age 21-65), and the three advisory scores above were removed. IDFC FIRST's 710 (salaried) and 760 (self-employed) are kept because the page states them as requirements. Matching was then re-run on a fresh upload: 10,000 users, 50,000 matches, 0 differences in both independent audits (`audit_matches.py` and `verify_match_user.sh`).
+
+Known gaps found by the audit and not fixed:
+
+- Moneyview and Paysense publish no detail link, so only their table rows are available, and one Bajaj Finserv entry duplicates another.
+- The LLM is not fully deterministic between crawls: for Indian Bank (a profession-based overdraft scheme) one crawl returned salaried only and another all three types, because the page mentions licensed professionals. Both readings are defensible; the guards cannot arbitrate between them.
+- Paisabazaar's income figures for some banks are its own estimates ("applicants with Rs 15,000 would be able to avail"), not the lender's stated minimum.
 
 Remaining differences I did not "fix": lender detail pages sometimes quote a slightly lower starting rate than the comparison table
 on the same site (Bandhan 8.82% vs 8.86%, Punjab & Sind 9.60% vs 9.90%, Canara 9.70% vs 9.95%); we use the rate-card numbers.

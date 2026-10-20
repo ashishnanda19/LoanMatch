@@ -6,8 +6,8 @@ const path = require('path');
 
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'normalize_extraction.js'), 'utf8');
 
-function run(provider, llmResponses) {
-  const originals = llmResponses.map((_, i) => ({ source_site: 's', product_name: `P${i}`, eligibility_text: 'Open to salaried and self-employed applicants.' }));
+function run(provider, llmResponses, text = 'Open to salaried and self-employed applicants. Minimum CIBIL score required is 685.') {
+  const originals = llmResponses.map((_, i) => ({ source_site: 's', product_name: `P${i}`, eligibility_text: text }));
   const wrap = (arr) => arr.map((j, i) => ({ json: j, pairedItem: { item: i } }));
   const $input = { all: () => wrap(llmResponses) };
   const $ = () => ({ itemMatching: (i) => wrap(originals)[i] });
@@ -144,4 +144,21 @@ test('safety net: when the page does mention self-employed applicants the LLM an
   const [r] = runWithText('groq', 'Salaried and self-employed professionals can apply.',
     [groq({ rules: [{ employment_types: ['Salaried', 'Self-Employed'], min_age: 21 }] })]);
   assert.deepStrictEqual(r.allowed_employment_types, ['Salaried', 'Self-Employed', 'Business']);
+});
+
+test('a credit score that is only soft guidance on the page is dropped', () => {
+  const body = groq({ rules: [{ employment_types: ['Salaried'], min_credit_score: 750, min_age: 21, max_age: 60 }] });
+  const [soft] = run('groq', [body], 'Salaried applicants aged 21 to 60. A CIBIL score of 750 or above usually gives higher chances of approval.');
+  assert.strictEqual(soft.min_credit_score, null, 'advice is not a requirement');
+  assert.strictEqual(soft.min_age, 21, 'other fields are untouched');
+  const [hard] = run('groq', [body], 'Salaried applicants aged 21 to 60. Minimum CIBIL score of 750 is required.');
+  assert.strictEqual(hard.min_credit_score, 750);
+  const [absent] = run('groq', [body], 'Salaried applicants aged 21 to 60.');
+  assert.strictEqual(absent.min_credit_score, null, 'a score that is nowhere in the text is invented');
+});
+
+test('a score in a table row whose keyword is in the previous sentence is still a requirement (IDFC-style)', () => {
+  const body = groq({ rules: [{ employment_types: ['Self-Employed'], min_credit_score: 760, min_age: 21, max_age: 60 }] });
+  const [r] = run('groq', [body], 'Self-employed individuals can apply. CIBIL score: For salaried: 710+. For self-employed: 760+.');
+  assert.strictEqual(r.min_credit_score, 760);
 });

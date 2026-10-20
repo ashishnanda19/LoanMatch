@@ -9,8 +9,9 @@ Field rules:
   Do NOT add them for a passing mention, for a niche or special-purpose scheme (healthcare, pension, education, vehicle, women-only), or for an offer limited to one profession (for example "also offers loans for doctors").
   If the text names no applicant type at all, use ["Salaried"].
 - min_income: MINIMUM MONTHLY net income in INR as an integer. Convert annual figures to monthly (divide by 12). null if not stated.
-- min_credit_score: minimum CIBIL / credit score (300-900), only if a number is explicitly stated, otherwise null. Never guess a typical value.
-- min_age / max_age: applicant age in years. For max_age use the stated maximum even if it is "at loan maturity". null if not stated.
+- min_credit_score: minimum CIBIL / credit score (300-900), only if the lender states it as a REQUIREMENT for this loan. Soft guidance ("usually", "ideally", "higher chances", "a score of 750+ is good", "most lenders prefer") is NOT a requirement: use null. Never guess a typical value.
+- min_age / max_age: applicant age in years for the general salaried personal loan. For max_age use the stated maximum even if it is "at loan maturity". Ignore age limits that belong to a niche scheme (pension loans, senior-citizen schemes, tenure-by-age tables). null if not stated.
+- Statements about "most lenders", "other banks" or "lenders in general" are not about this lender; ignore them.
 - If the criteria differ by applicant type (for example a different minimum income for salaried vs self-employed), output one rule per group. Otherwise output exactly ONE rule.
 - qualitative_criteria: a short plain-English summary (max 300 characters) of requirements the numeric fields cannot express: work experience, employer category, city/residence, education, existing bank relationship, nationality, business vintage. null if there are none.
 - Never invent numbers. When unsure, use null.

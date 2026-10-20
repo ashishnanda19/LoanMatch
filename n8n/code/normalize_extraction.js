@@ -16,6 +16,21 @@ const TYPES = ['Salaried', 'Self-Employed', 'Business'];
 // and for an employer-based product, which matched ~9,000 self-employed users to salaried-only lenders).
 const OTHER_TYPES_MENTIONED = /self[\s-]?employed|\bbusiness(?:es|man|men| owner)|proprietor|entrepreneur|msme|\btraders?\b|partnership|non[\s-]?salaried|professionals?/i;
 
+// A credit-score floor must be a REQUIREMENT stated on the page. Comparison sites are full of advice such as
+// "a score of 750 or above gives higher chances"; the LLM sometimes turns that into min_credit_score=750,
+// which would wrongly flag or reject users. Keep the value only if some sentence containing that number and
+// the words cibil/credit score is not soft guidance.
+const SOFT_GUIDANCE = /\b(usually|generally|typically|ideally|ideal|preferred|prefer|recommended|good|better|higher chances?|improve|increase your chances|most lenders|many lenders|other lenders|lenders (?:usually|generally|prefer))\b/i;
+function scoreIsRequirement(score, text) {
+  if (score === null) return true;
+  const sentences = String(text || '').split(/(?<=[.!?])\s+|\n/);
+  // Tables flatten to "CIBIL score: For salaried: 710+. For self-employed: 760+.", so the keyword may sit in the
+  // previous sentence; look at each sentence together with the one before it.
+  const num = new RegExp(`\\b${score}\\b`);
+  const mentions = sentences.filter((s, i) => num.test(s) && /cibil|credit score|credit rating|\bscore\b/i.test(`${sentences[i - 1] || ''} ${s}`));
+  return mentions.some((s) => !SOFT_GUIDANCE.test(s));
+}
+
 function responseText(res) {
   if (!res || res.error) return null;
   if (PROVIDER === 'groq') return (res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || null;
@@ -119,6 +134,9 @@ return $input.all().map((item, i) => {
 
   const allowOtherTypes = OTHER_TYPES_MENTIONED.test(String(original.eligibility_text || ''));
   const cleaned = parsed.rules.map((r) => cleanRule(r, allowOtherTypes)).filter(Boolean);
+  for (const r of cleaned) {
+    if (!scoreIsRequirement(r.min_credit_score, original.eligibility_text)) r.min_credit_score = null;
+  }
   if (!cleaned.length) return fail('no usable rules');
   const rules = mergeRules(cleaned);
 
@@ -134,7 +152,7 @@ return $input.all().map((item, i) => {
       ...envelope(rules),
       eligibility_rules: rules,
       qualitative_criteria_text: q,
-      raw_criteria_text: (original.eligibility_text || '').slice(0, 2000),
+      raw_criteria_text: (original.eligibility_text || '').slice(0, 3500),
     },
   };
 });
