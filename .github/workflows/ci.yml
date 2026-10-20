@@ -47,7 +47,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pg8000==1.31.5
+      - run: pip install pg8000==1.31.5 boto3   # boto3 is preinstalled in the Lambda runtime, not on the CI runner
       - name: Apply the base schema
         run: psql "postgresql://postgres:x@localhost:55432/postgres" -v ON_ERROR_STOP=1 -q -f db/migrations/001_init.sql
       - name: Run the tests
