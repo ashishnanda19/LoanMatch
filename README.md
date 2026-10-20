@@ -96,11 +96,292 @@ flowchart TB
 
 | | Workflow | Triggers | What it does | Nodes |
 |---|---|---|---|---|
-| **A** | Loan Product Discovery | schedule 02:00 daily, manual, `POST /webhook/crawl-now` | Reads three sources, pulls each lender's eligibility text, has an LLM turn it into per-employment-type numeric rules, upserts `loan_products`, then hands off to R | 21 |
+| **A** | Loan Product Discovery | schedule 02:00 daily, manual, `POST /webhook/crawl-now` | Reads three sources, pulls each lender's eligibility text, has an LLM turn it into per-employment-type numeric rules, upserts `loan_products`, then hands off to R | 22 |
 | **B** | User-Loan Matching | `POST /webhook/batch-ready` (called by the parse-csv Lambda) | Multi-stage SQL funnel that matches 10,000 users and keeps each user's top 5. No LLM. Then calls R (waits) and C | 17 |
 | **R** | Lender Notes | called by A and B, `POST /webhook/review-now`, manual | One LLM call per lender writes the short "good to know" note for each employment type it accepts. Cached by content hash, saved after every batch of 6 | 24 |
 | **C** | Match Notifications | called by B, `POST /webhook/notify-now`, manual | One email per user via Amazon SES, to test aliases only; marks `notified_at` only after SES accepts | 15 |
 | **E** | Failure Alerts | n8n starts it when A, B, R or C fails (their *error workflow* setting) | Mails the failure (workflow, node, error, link to the run) to the owner's verified SES address, so a failed run is never silent | 4 |
+
+#### The workflows as drawn in n8n
+
+<!-- workflows:start -->
+Each diagram is generated from the workflow's exported JSON by [`scripts/build_workflow_diagrams.py`](scripts/build_workflow_diagrams.py), so it always matches what is in [`n8n/workflows/`](n8n/workflows). Blue rounded = trigger, yellow cylinder = database (SQL), green slanted = external call (LLM, web, SES), double-bordered = another workflow, diamond = decision, plain box = Code node.
+
+<details>
+<summary><b>Workflow A: Loan Product Discovery (the crawler)</b> (22 nodes, <a href="n8n/workflows/A_loan_product_discovery.json">A_loan_product_discovery.json</a>)</summary>
+
+Three triggers, three lender sources. The rate table is parsed without an LLM; each lender's page is cut down to its eligibility facts; Groq extracts numeric rules, Gemini is the fallback, and invalid answers are dropped.
+
+```mermaid
+flowchart TD
+  n0(["Daily schedule"])
+  n1(["Manual trigger"])
+  n2(["Crawl now (webhook)"])
+  n3["Seed sources"]
+  n4[/"Fetch list page"/]
+  n5["Parse lender tables"]
+  n6[/"Fetch lender page"/]
+  n7["Extract eligibility text"]
+  n8{"Has eligibility text?"}
+  n9("Skipped: no eligibility text")
+  n10["Build LLM prompt"]
+  n11[/"Groq: extract criteria"/]
+  n12["Validate groq output"]
+  n13{"Groq output valid?"}
+  n14[/"Gemini fallback: extract criteria"/]
+  n15["Validate gemini output"]
+  n16{"Gemini output valid?"}
+  n17("Dropped: both LLMs failed")
+  n18["Merge extraction results"]
+  n19[("Upsert loan product")]
+  n20["Crawl summary"]
+  n21[["Start Workflow R (lender notes)"]]
+  n0 --> n3
+  n1 --> n3
+  n2 --> n3
+  n3 --> n4
+  n4 --> n5
+  n5 --> n6
+  n6 --> n7
+  n7 --> n8
+  n8 -->|yes| n10
+  n8 -->|no| n9
+  n10 --> n11
+  n11 --> n12
+  n12 --> n13
+  n13 -->|yes| n18
+  n13 -->|no| n14
+  n14 --> n15
+  n15 --> n16
+  n16 -->|yes| n18
+  n16 -->|no| n17
+  n18 --> n19
+  n19 --> n20
+  n20 --> n21
+  classDef trig fill:#e8f0ff,stroke:#2d5bd6,color:#102a6b
+  classDef db fill:#fff4d6,stroke:#b7791f,color:#5a3a00
+  classDef ext fill:#e6f7ee,stroke:#1f8a4c,color:#0b3d22
+  class n0 trig
+  class n1 trig
+  class n2 trig
+  class n4 ext
+  class n6 ext
+  class n11 ext
+  class n14 ext
+  class n19 db
+  class n21 ext
+```
+
+</details>
+
+<details>
+<summary><b>Workflow B: User-Loan Matching (the multi-stage filter)</b> (18 nodes, <a href="n8n/workflows/B_user_loan_matching.json">B_user_loan_matching.json</a>)</summary>
+
+Called by the parse-csv Lambda. Reconciles lenders, then SQL stages shrink 450,000 user-lender pairs to a top 5 per user. No LLM. Then it asks R for notes (and waits) and starts C.
+
+```mermaid
+flowchart TD
+  n0(["Batch ready (webhook)"])
+  n1["Validate payload"]
+  n2[("Mark batch matching")]
+  n3[("Load fresh products")]
+  n4["Stage 0: reconcile lenders"]
+  n5["Collect canonical product ids"]
+  n6[("Save lender offers")]
+  n7[("Reset candidates")]
+  n8[("Stage 1: SQL envelope pre-filter")]
+  n9[("Stage 2: exact per-type rules")]
+  n10[("Stage 3: rank and keep top lenders")]
+  n11["Funnel report"]
+  n12[("Finish batch")]
+  n13[("Clean up candidates")]
+  n14["Prepare review request"]
+  n15[["Start Workflow R (notes for matched lenders)"]]
+  n16["Prepare hand-off"]
+  n17[["Start Workflow C (notifications)"]]
+  n0 --> n1
+  n1 --> n2
+  n2 --> n3
+  n3 --> n4
+  n4 --> n5
+  n5 --> n6
+  n6 --> n7
+  n7 --> n8
+  n8 --> n9
+  n9 --> n10
+  n10 --> n11
+  n11 --> n12
+  n12 --> n13
+  n13 --> n14
+  n14 --> n15
+  n15 --> n16
+  n16 --> n17
+  classDef trig fill:#e8f0ff,stroke:#2d5bd6,color:#102a6b
+  classDef db fill:#fff4d6,stroke:#b7791f,color:#5a3a00
+  classDef ext fill:#e6f7ee,stroke:#1f8a4c,color:#0b3d22
+  class n0 trig
+  class n2 db
+  class n3 db
+  class n6 db
+  class n7 db
+  class n8 db
+  class n9 db
+  class n10 db
+  class n12 db
+  class n13 db
+  class n15 ext
+  class n17 ext
+```
+
+</details>
+
+<details>
+<summary><b>Workflow R: Lender Notes (the cached LLM reviews)</b> (24 nodes, <a href="n8n/workflows/R_lender_notes.json">R_lender_notes.json</a>)</summary>
+
+One LLM call per lender, only when the lender's text changed (content-hash cache). Groq and Gemini lanes, results saved every 6 lenders.
+
+```mermaid
+flowchart TD
+  n0(["Executed by another workflow"])
+  n1(["Manual trigger"])
+  n2(["Review now (webhook)"])
+  n3["Read review request"]
+  n4[("Plan reviews (cache check)")]
+  n5{"Needs LLM review?"}
+  n6("No reviews needed")
+  n7["Assign provider"]
+  n8["Loop over lenders"]
+  n9["Build review prompt"]
+  n10{"Groq lane?"}
+  n11[/"Groq: review lender"/]
+  n12["Validate groq review"]
+  n13{"Groq answer complete?"}
+  n14[/"Gemini fallback: review lender"/]
+  n15["Validate gemini fallback review"]
+  n16[/"Gemini: review lender"/]
+  n17["Validate gemini review"]
+  n18["Merge review results"]
+  n19["Collect rows to save"]
+  n20[("Upsert reviews")]
+  n21["Total saved"]
+  n22[("Coverage check")]
+  n23["Review summary"]
+  n0 --> n3
+  n1 --> n3
+  n2 --> n3
+  n3 --> n4
+  n4 --> n5
+  n5 -->|yes| n7
+  n5 -->|no| n6
+  n7 --> n8
+  n8 -->|done| n21
+  n8 -->|next lender| n9
+  n9 --> n10
+  n10 -->|yes| n11
+  n10 -->|no| n16
+  n11 --> n12
+  n12 --> n13
+  n13 -->|yes| n18
+  n13 -->|no| n14
+  n14 --> n15
+  n15 --> n18
+  n16 --> n17
+  n17 --> n18
+  n18 --> n19
+  n19 --> n20
+  n20 --> n8
+  n21 --> n22
+  n22 --> n23
+  classDef trig fill:#e8f0ff,stroke:#2d5bd6,color:#102a6b
+  classDef db fill:#fff4d6,stroke:#b7791f,color:#5a3a00
+  classDef ext fill:#e6f7ee,stroke:#1f8a4c,color:#0b3d22
+  class n0 trig
+  class n1 trig
+  class n2 trig
+  class n4 db
+  class n11 ext
+  class n14 ext
+  class n16 ext
+  class n20 db
+  class n22 db
+```
+
+</details>
+
+<details>
+<summary><b>Workflow C: Match Notifications (SES)</b> (15 nodes, <a href="n8n/workflows/C_match_notifications.json">C_match_notifications.json</a>)</summary>
+
+One email per user to a test alias, marked as sent only after SES accepts, so failures retry and a second run sends nothing.
+
+```mermaid
+flowchart TD
+  n0(["Executed by Workflow B"])
+  n1(["Manual trigger"])
+  n2(["Notify now (webhook)"])
+  n3["Read batch id"]
+  n4[("Load pending notifications")]
+  n5{"Anyone to email?"}
+  n6("Nothing to send")
+  n7["Build email"]
+  n8[/"Send via SES"/]
+  n9["Record send outcome"]
+  n10{"Email accepted by SES?"}
+  n11[("Mark matches notified")]
+  n12("Left un-notified (will retry)")
+  n13["Merge outcomes"]
+  n14["Notification summary"]
+  n0 --> n3
+  n1 --> n3
+  n2 --> n3
+  n3 --> n4
+  n4 --> n5
+  n5 -->|yes| n7
+  n5 -->|no| n6
+  n7 --> n8
+  n8 --> n9
+  n9 --> n10
+  n10 -->|yes| n11
+  n10 -->|no| n12
+  n11 --> n13
+  n12 --> n13
+  n13 --> n14
+  classDef trig fill:#e8f0ff,stroke:#2d5bd6,color:#102a6b
+  classDef db fill:#fff4d6,stroke:#b7791f,color:#5a3a00
+  classDef ext fill:#e6f7ee,stroke:#1f8a4c,color:#0b3d22
+  class n0 trig
+  class n1 trig
+  class n2 trig
+  class n4 db
+  class n8 ext
+  class n11 db
+```
+
+</details>
+
+<details>
+<summary><b>Workflow E: Failure Alerts (the error workflow)</b> (4 nodes, <a href="n8n/workflows/E_failure_alerts.json">E_failure_alerts.json</a>)</summary>
+
+n8n starts this when A, B, C or R fails, and emails the owner the workflow, node and error.
+
+```mermaid
+flowchart LR
+  n0(["Error Trigger"])
+  n1[("Load alert address")]
+  n2["Build alert"]
+  n3[/"Send alert via SES"/]
+  n0 --> n1
+  n1 --> n2
+  n2 --> n3
+  classDef trig fill:#e8f0ff,stroke:#2d5bd6,color:#102a6b
+  classDef db fill:#fff4d6,stroke:#b7791f,color:#5a3a00
+  classDef ext fill:#e6f7ee,stroke:#1f8a4c,color:#0b3d22
+  class n0 trig
+  class n1 db
+  class n3 ext
+```
+
+</details>
+<!-- workflows:end -->
 
 The workflow JSON in [`n8n/workflows/`](n8n/workflows) is generated by [`scripts/build_workflows.py`](scripts/build_workflows.py)
 from the tested Code-node sources in [`n8n/code/`](n8n/code) and the SQL in [`n8n/sql/`](n8n/sql). I verified that the
@@ -120,15 +401,15 @@ do all per-user work in SQL on numbers. Candidate pairs never leave Postgres, so
 |---|---|---:|---:|
 | naive | every user × every lender record | **450,000** | |
 | 0 · reconcile lenders (Code node) | the same bank on several sites collapses to one record (45 → 34 lenders, 11 merged groups) | 340,000 | <1 s |
-| 1 · envelope pre-filter (SQL) | a permissive min/max per lender (a NULL means "no stated limit") drops the clearly ineligible, written to a staging table | 252,563 | ~5 s |
-| 2 · exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI: Salaried needs ₹30,000, Self-Employed has no income floor | 242,095 | ~2 s |
+| 1 · envelope pre-filter (SQL) | a permissive min/max per lender (a NULL means "no stated limit") drops the clearly ineligible, written to a staging table | 255,951 | ~5 s |
+| 2 · exact rules (SQL over JSON) | per-employment-type rules, e.g. ICICI: Salaried needs ₹30,000, Self-Employed has no income floor | 246,591 | ~2 s |
 | 3 · rank, keep top 5 (SQL window function) | flagged-score matches last, then lowest rate, then widest credit-score margin | **50,000** | ~1 s |
 | LLM calls in all of the above | | **0** | |
 
-Whole workflow B on the real 10,000-user batch: **16-18 s** end to end including the network hop to RDS.
+Whole workflow B on the real 10,000-user batch: **16-19 s** end to end including the network hop to RDS.
 
 **Be honest about where the savings come from.** Most lenders state loose requirements, so the numeric filters only
-remove about 29% of the pairs (340,000 → 242,095). The big wins are (1) keeping the LLM out of the per-user path
+remove about 27% of the pairs (340,000 → 246,591). The big wins are (1) keeping the LLM out of the per-user path
 entirely, (2) merging duplicate lenders, and (3) ranking to a top 5 so only 50,000 rows are written and mailed.
 
 ### What the LLM does, and how that is made cheap

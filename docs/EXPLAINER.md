@@ -27,11 +27,11 @@ Schedule, manual or webhook → seed three sources → parse the lender table fr
 The naive way is 10,000 users × 45 lenders = 450,000 LLM calls. Instead:
 
 1. **Stage 0** reconciles the same bank listed on several sites into one record (45 → 34 lenders, so 340,000 pairs) and keeps the lowest published rate.
-2. **Stage 1** is a SQL "envelope": the loosest bounds of any of a lender's rules, with NULL meaning "no stated limit", so it can never drop someone who qualifies (252,563 pairs).
-3. **Stage 2** applies the exact per-employment-type rules (242,095 pairs).
+2. **Stage 1** is a SQL "envelope": the loosest bounds of any of a lender's rules, with NULL meaning "no stated limit", so it can never drop someone who qualifies (255,951 pairs).
+3. **Stage 2** applies the exact per-employment-type rules (246,591 pairs).
 4. **Stage 3** ranks (unflagged first, then lowest rate, then widest score margin) and keeps the top 5 per user (50,000 matches).
 
-The LLM makes **zero** calls here. Its only jobs are reading each lender once (A) and writing a short "good to know" note once per lender (R). Adding users adds no LLM cost. Be honest on camera: the numeric filters remove about 25% of the reconciled pairs; the real saving is keeping the LLM out of the per-user path and ranking to a short list.
+The LLM makes **zero** calls here. Its only jobs are reading each lender once (A) and writing a short "good to know" note once per lender (R). Adding users adds no LLM cost. Be honest on camera: the numeric filters remove about 27% of the reconciled pairs; the real saving is keeping the LLM out of the per-user path and ranking to a short list.
 
 ## Workflow R: lender notes
 
