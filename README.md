@@ -1,6 +1,6 @@
 # Loan Eligibility Engine
 
-Upload a CSV of users, crawl personal-loan products from the web, match each user to the lenders they qualify for, and email their best five. Built on AWS (ap-south-1) with a self-hosted n8n. The numbers below come from a real run on the supplied 10,000-user file.
+Upload a CSV of users, crawl personal-loan products from the web, match each user to the lenders they qualify for, and email their best five. Built on AWS with a self-hosted n8n. The numbers below come from a real run on the supplied 10,000-user file.
 
 ## Demo
 
